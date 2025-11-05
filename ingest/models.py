@@ -38,3 +38,5 @@ class SegmentInput:
     raw_reference: Optional[str]
     blocks: List[SegmentBlockInput] = field(default_factory=list)
     assets: List[SegmentAssetInput] = field(default_factory=list)
+    quality_score: Optional[float] = None
+    is_noise: bool = False

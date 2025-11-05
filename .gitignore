@@ -1,5 +1,7 @@
 .env
 
+docs/reference/pgai/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

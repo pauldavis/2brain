@@ -1,0 +1,42 @@
+@import "tailwindcss";
+@plugin "daisyui";
+
+@layer base {
+  body {
+    @apply bg-slate-950 text-slate-100;
+  }
+}
+
+@layer components {
+  .markdown {
+    @apply space-y-4 text-slate-100;
+  }
+
+  .markdown p {
+    @apply leading-relaxed;
+  }
+
+  .markdown strong {
+    @apply text-slate-50;
+  }
+
+  .markdown em {
+    @apply text-pink-200;
+  }
+
+  .markdown a {
+    @apply text-sky-300 underline decoration-sky-500/50 underline-offset-4;
+  }
+
+  .markdown ul {
+    @apply list-disc pl-6 space-y-2;
+  }
+
+  .markdown ol {
+    @apply list-decimal pl-6 space-y-2;
+  }
+
+  .markdown li {
+    @apply leading-relaxed;
+  }
+}

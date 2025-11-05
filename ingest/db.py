@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import string
 from datetime import datetime
 from typing import Mapping, Sequence
 
@@ -7,6 +8,57 @@ import psycopg
 from psycopg.types.json import Json
 
 from ingest.models import SegmentInput
+
+QUALITY_NOISE_THRESHOLD = 0.2
+
+
+def estimate_segment_quality(markdown: str, plaintext: str) -> tuple[float, bool]:
+    """
+    Produce a lightweight quality score and noise flag for a segment.
+
+    The heuristic favours segments with enough lexical variety and alphabetic
+    content, while aggressively pruning extremely short or punctuation-heavy
+    chunks that tend to be export noise.
+    """
+    text = (plaintext or "").strip()
+    if not text:
+        text = (markdown or "").strip()
+    if not text:
+        return 0.0, True
+
+    normalized = " ".join(text.split())
+    length = len(normalized)
+    tokens = normalized.split()
+    token_count = len(tokens)
+    unique_tokens = len(set(tokens))
+
+    alnum_chars = sum(ch.isalnum() for ch in normalized)
+    punctuation_chars = sum(ch in string.punctuation for ch in normalized)
+
+    alpha_ratio = alnum_chars / length if length else 0.0
+    punctuation_ratio = punctuation_chars / length if length else 0.0
+    diversity_ratio = unique_tokens / token_count if token_count else 0.0
+
+    length_score = min(1.0, token_count / 80)
+    diversity_score = diversity_ratio
+    character_score = alpha_ratio
+    noise_penalty = max(0.0, punctuation_ratio - 0.15)
+
+    score = (
+        0.5 * length_score
+        + 0.3 * character_score
+        + 0.2 * diversity_score
+        - 0.4 * noise_penalty
+    )
+    score = max(0.0, min(1.0, score))
+
+    is_noise = (
+        score < 0.2
+        or token_count < 3
+        or unique_tokens <= 1
+        or alpha_ratio < 0.25
+    )
+    return score, is_noise
 
 
 def persist_document(
@@ -87,6 +139,21 @@ def persist_document(
         node_to_segment_id: dict[str, str] = {}
         for segment in segments:
             parent_segment_id = node_to_segment_id.get(segment.parent_node_id)
+            auto_score, auto_noise = estimate_segment_quality(
+                segment.content_markdown,
+                segment.plaintext,
+            )
+            quality_score = (
+                segment.quality_score
+                if segment.quality_score is not None
+                else auto_score
+            )
+            if segment.is_noise:
+                is_noise = True
+            elif segment.quality_score is not None:
+                is_noise = segment.quality_score < QUALITY_NOISE_THRESHOLD
+            else:
+                is_noise = auto_noise
             cur.execute(
                 """
                 INSERT INTO document_segments (
@@ -98,6 +165,8 @@ def persist_document(
                     content_markdown,
                     content_plaintext,
                     content_json,
+                    quality_score,
+                    is_noise,
                     started_at,
                     ended_at,
                     raw_reference
@@ -105,7 +174,7 @@ def persist_document(
                 VALUES (
                     %s, %s, %s, %s, %s, %s,
                     to_tsvector('english', %s),
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id
                 """,
@@ -118,6 +187,8 @@ def persist_document(
                     segment.content_markdown,
                     segment.plaintext,
                     Json(segment.content_json) if segment.content_json is not None else None,
+                    quality_score,
+                    is_noise,
                     segment.started_at,
                     segment.ended_at,
                     segment.raw_reference,
