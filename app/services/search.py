@@ -50,6 +50,8 @@ WHERE (query_cte.ts_query IS NULL OR ds.content_plaintext @@ query_cte.ts_query)
   AND (query_cte.source_system_filter IS NULL OR d.source_system = query_cte.source_system_filter)
   AND (query_cte.source_role_filter IS NULL OR ds.source_role = query_cte.source_role_filter)
   AND (query_cte.document_filter IS NULL OR d.id = query_cte.document_filter)
+  AND ds.is_noise = FALSE
+  AND ds.embedding_status = 'ready'
 ORDER BY ds.started_at NULLS LAST, ds.sequence
 LIMIT %(limit)s OFFSET %(offset)s;
 """

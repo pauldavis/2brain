@@ -1,10 +1,10 @@
 # PGAI Vectorizer integration checklist
 
-- [ ] Apply migration `0002_segment_embeddings.sql` to add quality + embedding columns and trigger logic.
-- [ ] Run `pgai install -d <db_url>` in each environment to provision the `ai.*` schema and helper functions.
-- [ ] Configure embedding provider credentials for pgai (Timescale Console API key store or environment variables such as `OPENAI_API_KEY` / `VOYAGE_API_KEY`).
-- [ ] Confirm ingestion pipeline populates `quality_score` / `is_noise`; override per segment if upstream signals exist (`ingest/db.py` auto-heuristic is the baseline).
-- [ ] Create the column-destination vectorizer targeting `document_segments.embedding`:
+- [x] Apply migration `0002_segment_embeddings.sql` to add quality + embedding columns and trigger logic.
+- [x] Run `pgai install -d <db_url>` in each environment to provision the `ai.*` schema and helper functions.
+- [x] Configure embedding provider credentials for pgai (Timescale Console API key store or environment variables such as `OPENAI_API_KEY` / `VOYAGE_API_KEY`).
+- [x] Confirm ingestion pipeline populates `quality_score` / `is_noise`; override per segment if upstream signals exist (`ingest/db.py` auto-heuristic is the baseline).
+- [x] Create the column-destination vectorizer targeting `document_segments.embedding`:
   ```sql
   SELECT ai.create_vectorizer(
       'public.document_segments'::regclass,
@@ -27,7 +27,9 @@
   - [ ] `SELECT * FROM ai.vectorizer_status;` (queue depth / last runs).
   - [ ] `SELECT * FROM ai.vectorizer_errors WHERE vectorizer_id = <id>;` (API/parsing issues).
   - [ ] Tune `ai.processing_default` if rate limits or latency spikes appear.
-- [ ] Ensure downstream search paths filter `is_noise = FALSE` and `embedding_status = 'ready'`.
+- [x] Ensure downstream search paths filter `is_noise = FALSE` and `embedding_status = 'ready'` (`app/services/search.py`).
 - [ ] Follow-up enhancements:
   - [ ] Build partial BM25 index on `document_segments` (`WHERE is_noise = FALSE`) for hybrid ranking.
   - [ ] Add a maintenance job that nulls embeddings + re-enqueues segments when `quality_score` changes materially.
+
+> **Timescale Cloud note:** If `ai.*` objects are missing, install pgai once from the Console or CLI, then rerun the vectorizer SQL.
