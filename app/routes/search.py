@@ -7,7 +7,14 @@ from fastapi import APIRouter, Depends, Query
 
 from app.db import get_connection
 from app.schemas import SearchResult
-from app.services.search import search_segments
+from app.metrics import log_query_stat
+import time
+from app.services.search import (
+    search_segments,
+    search_segments_bm25,
+    search_segments_hybrid_rrf,
+    embed_query_openai,
+)
 
 
 router = APIRouter(tags=["search"])
@@ -33,3 +40,73 @@ def search_endpoint(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/search/bm25", response_model=List[SearchResult])
+def search_bm25_endpoint(
+    q: str = Query(..., description="BM25 keyword query"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    threshold: float | None = Query(None, description="Optional score cutoff; lower (more negative) is better."),
+    conn=Depends(get_connection),
+) -> List[SearchResult]:
+    t0 = time.perf_counter()
+    results, meta = search_segments_bm25(
+        conn,
+        q=q,
+        limit=limit,
+        offset=offset,
+        threshold=threshold,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    log_query_stat(
+        {
+            "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "mode": "bm25",
+            "q": q,
+            "count": meta.get("count"),
+            "best_score": meta.get("best_score"),
+            "threshold": threshold,
+            "elapsed_ms": round(elapsed_ms, 2),
+        }
+    )
+    return results
+
+
+@router.get("/search/hybrid", response_model=List[SearchResult])
+def search_hybrid_endpoint(
+    q: str = Query(..., description="Free-form query; embedded via OpenAI"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    w_bm25: float = Query(0.5, ge=0.0, le=1.0),
+    w_vec: float = Query(0.5, ge=0.0, le=1.0),
+    k: int = Query(60, ge=1),
+    conn=Depends(get_connection),
+) -> List[SearchResult]:
+    qvec = embed_query_openai(q)
+    t0 = time.perf_counter()
+    results, meta = search_segments_hybrid_rrf(
+        conn,
+        q=q,
+        q_embedding=qvec,
+        limit=limit,
+        offset=offset,
+        w_bm25=w_bm25,
+        w_vec=w_vec,
+        k=k,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    log_query_stat(
+        {
+            "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "mode": "hybrid",
+            "q": q,
+            "count": meta.get("count"),
+            "best_score": meta.get("best_score"),
+            "w_bm25": w_bm25,
+            "w_vec": w_vec,
+            "k": k,
+            "elapsed_ms": round(elapsed_ms, 2),
+        }
+    )
+    return results
