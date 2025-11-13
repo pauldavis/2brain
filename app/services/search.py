@@ -29,6 +29,9 @@ SELECT
     d.id AS document_id,
     d.title AS document_title,
     d.source_system,
+    d.updated_at AS document_updated_at,
+    stats.segment_count,
+    stats.char_count,
     ds.id AS segment_id,
     ds.sequence,
     ds.source_role,
@@ -47,6 +50,13 @@ JOIN LATERAL (
     LIMIT 1
 ) latest_version ON TRUE
 JOIN document_segments ds ON ds.document_version_id = latest_version.id
+JOIN LATERAL (
+    SELECT
+        COUNT(*) AS segment_count,
+        COALESCE(SUM(NULLIF(length(ds_all.content_markdown), 0)), 0) AS char_count
+    FROM document_segments ds_all
+    WHERE ds_all.document_version_id = latest_version.id
+) stats ON TRUE
 WHERE (query_cte.ts_query IS NULL OR ds.content_plaintext @@ query_cte.ts_query)
   AND (query_cte.source_system_filter IS NULL OR d.source_system = query_cte.source_system_filter)
   AND (query_cte.source_role_filter IS NULL OR ds.source_role = query_cte.source_role_filter)
@@ -64,10 +74,13 @@ WITH ranked AS (
         dv.document_id AS document_id,
         d.title AS document_title,
         d.source_system AS source_system,
+        d.updated_at AS document_updated_at,
         ds.sequence,
         ds.source_role,
         LEFT(ds.content_markdown, 280) AS snippet,
-        ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx') AS score
+        ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx') AS score,
+        stats.segment_count,
+        stats.char_count
     FROM documents d
     JOIN LATERAL (
         SELECT dv.id, dv.document_id
@@ -77,11 +90,21 @@ WITH ranked AS (
         LIMIT 1
     ) dv ON TRUE
     JOIN document_segments ds ON ds.document_version_id = dv.id
+    JOIN LATERAL (
+        SELECT
+            COUNT(*) AS segment_count,
+            COALESCE(SUM(NULLIF(length(ds_all.content_markdown), 0)), 0) AS char_count
+        FROM document_segments ds_all
+        WHERE ds_all.document_version_id = dv.id
+    ) stats ON TRUE
 )
 SELECT
     document_id,
     document_title,
     source_system,
+    document_updated_at,
+    segment_count,
+    char_count,
     segment_id,
     sequence,
     source_role,
@@ -123,15 +146,25 @@ SELECT
   d.id AS document_id,
   d.title AS document_title,
   d.source_system,
+  d.updated_at AS document_updated_at,
   ds.id AS segment_id,
   ds.sequence,
   ds.source_role,
   LEFT(ds.content_markdown, 280) AS snippet,
-  sc.score
+  sc.score,
+  stats.segment_count,
+  stats.char_count
 FROM scores sc
 JOIN public.document_segments ds ON ds.id = sc.segment_id
 JOIN public.document_versions dv ON dv.id = ds.document_version_id
 JOIN public.documents d ON d.id = dv.document_id
+JOIN LATERAL (
+    SELECT
+        COUNT(*) AS segment_count,
+        COALESCE(SUM(NULLIF(length(ds_all.content_markdown), 0)), 0) AS char_count
+    FROM document_segments ds_all
+    WHERE ds_all.document_version_id = dv.id
+) stats ON TRUE
 ORDER BY sc.score DESC
 LIMIT %(limit)s OFFSET %(offset)s;
 """
@@ -163,6 +196,9 @@ def search_segments(
             document_id=row["document_id"],
             document_title=row["document_title"],
             source_system=row["source_system"],
+            document_updated_at=row["document_updated_at"],
+            document_segment_count=row["segment_count"],
+            document_char_count=row["char_count"],
             segment_id=row["segment_id"],
             sequence=row["sequence"],
             source_role=row["source_role"],
@@ -196,6 +232,9 @@ def search_segments_bm25(
             document_id=row["document_id"],
             document_title=row["document_title"],
             source_system=row["source_system"],
+            document_updated_at=row["document_updated_at"],
+            document_segment_count=row["segment_count"],
+            document_char_count=row["char_count"],
             segment_id=row["segment_id"],
             sequence=row["sequence"],
             source_role=row["source_role"],
@@ -240,6 +279,9 @@ def search_segments_hybrid_rrf(
             document_id=row["document_id"],
             document_title=row["document_title"],
             source_system=row["source_system"],
+            document_updated_at=row["document_updated_at"],
+            document_segment_count=row["segment_count"],
+            document_char_count=row["char_count"],
             segment_id=row["segment_id"],
             sequence=row["sequence"],
             source_role=row["source_role"],

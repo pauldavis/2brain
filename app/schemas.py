@@ -83,6 +83,22 @@ class DocumentView(BaseModel):
     keywords: List[Keyword] = Field(default_factory=list)
 
 
+class DocumentTranscript(BaseModel):
+    document: Document
+    version: DocumentVersion
+    segment_count: int
+    generated_at: datetime
+    markdown: str
+
+
+class SegmentExport(BaseModel):
+    document: Document
+    version: DocumentVersion
+    segment: Segment
+    generated_at: datetime
+    markdown: str
+
+
 class DocumentSummary(BaseModel):
     id: UUID
     title: str
@@ -96,6 +112,9 @@ class SearchResult(BaseModel):
     document_id: UUID
     document_title: str
     source_system: str
+    document_updated_at: Optional[datetime] = None
+    document_segment_count: Optional[int] = None
+    document_char_count: Optional[int] = None
     segment_id: UUID
     sequence: int
     source_role: str

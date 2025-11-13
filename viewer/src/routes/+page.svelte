@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
-	import type { DocumentSummary, DocumentView, Segment } from '$lib/types';
+	import type { DocumentSummary, DocumentTranscript, DocumentView, Segment } from '$lib/types';
 	import { marked } from 'marked';
 
 	const props = $props<{ data: PageData }>();
@@ -21,7 +21,21 @@
 	let loadError = $state('');
 
 	const segments = $derived<Segment[]>(selectedDocument?.segments ?? []);
-	const currentSegment = $derived<Segment | null>(segments[selectedSegmentIndex] ?? null);
+	let showEmptySegments = $state(true);
+	let pendingSegmentId = $state<string | null>(data.initialSegmentId ?? null);
+	const visibleSegments = $derived<Segment[]>(
+		showEmptySegments
+			? segments
+			: segments.filter((segment) => segmentHasContent(segment))
+	);
+	const hiddenSegmentCount = $derived(Math.max(0, segments.length - visibleSegments.length));
+	const currentSegment = $derived<Segment | null>(visibleSegments[selectedSegmentIndex] ?? null);
+	let transcript = $state<DocumentTranscript | null>(null);
+	let transcriptError = $state('');
+	let isTranscriptLoading = $state(false);
+	const transcriptDownloadUrl = $derived<string | null>(
+		selectedDocumentId ? `${API_BASE}/documents/${selectedDocumentId}/transcript?format=markdown&download=1` : null
+	);
 
 	const dateFormatter = new Intl.DateTimeFormat('en-US', {
 		year: 'numeric',
@@ -36,7 +50,7 @@
 		return dateFormatter.format(new Date(value));
 	}
 
-	async function selectDocument(id: string) {
+	async function selectDocument(id: string, segmentId?: string | null) {
 		if (id === selectedDocumentId) return;
 		isLoadingDocument = true;
 		loadError = '';
@@ -48,6 +62,9 @@
 			const doc: DocumentView = await res.json();
 			selectedDocument = doc;
 			selectedSegmentIndex = 0;
+			pendingSegmentId = segmentId ?? null;
+			transcript = null;
+			transcriptError = '';
 		} catch (error) {
 			console.error(error);
 			loadError = error instanceof Error ? error.message : 'Unknown error while loading document.';
@@ -56,14 +73,34 @@
 		}
 	}
 
+	async function loadTranscript(force = false) {
+		if (!selectedDocumentId || !selectedDocument) return;
+		if (transcript && transcript.document.id === selectedDocumentId && !force) return;
+		isTranscriptLoading = true;
+		transcriptError = '';
+		try {
+			const res = await fetch(`${API_BASE}/documents/${selectedDocumentId}/transcript`);
+			if (!res.ok) {
+				throw new Error(`Failed to load transcript (${res.status})`);
+			}
+			const payload: DocumentTranscript = await res.json();
+			transcript = payload;
+		} catch (error) {
+			console.error(error);
+			transcriptError = error instanceof Error ? error.message : 'Unknown error while loading transcript.';
+		} finally {
+			isTranscriptLoading = false;
+		}
+	}
+
 	function previousSegment() {
-		if (!selectedDocument) return;
+		if (!selectedDocument || visibleSegments.length === 0) return;
 		selectedSegmentIndex = Math.max(0, selectedSegmentIndex - 1);
 	}
 
 	function nextSegment() {
-		if (!selectedDocument) return;
-		selectedSegmentIndex = Math.min(segments.length - 1, selectedSegmentIndex + 1);
+		if (!selectedDocument || visibleSegments.length === 0) return;
+		selectedSegmentIndex = Math.min(visibleSegments.length - 1, selectedSegmentIndex + 1);
 	}
 
 	marked.setOptions({ breaks: true, gfm: true });
@@ -95,17 +132,65 @@
 				return type.charAt(0).toUpperCase() + type.slice(1);
 		}
 	}
+
+	function segmentHasContent(segment: Segment) {
+		const markdownText = segment.content_markdown?.trim() ?? '';
+		if (markdownText.length > 0) return true;
+		if (segment.blocks?.length) {
+			return segment.blocks.some((block) => (block.body?.trim()?.length ?? 0) > 0);
+		}
+		return false;
+	}
+
+	function segmentAccentClass(role: string) {
+		switch (role) {
+			case 'assistant':
+				return 'border-l-4 border-l-sky-400 pl-4';
+			case 'user':
+				return 'border-l-4 border-l-amber-400 pl-4';
+			case 'system':
+				return 'border-l-4 border-l-slate-400 pl-4';
+			default:
+				return 'border-l-4 border-l-emerald-300 pl-4';
+		}
+	}
+
+	function downloadSegment(segmentId: string) {
+		const url = `${API_BASE}/documents/segments/${segmentId}/export?format=markdown&download=1`;
+		const link = document.createElement('a');
+		link.href = url;
+		link.target = '_blank';
+		link.rel = 'noreferrer';
+		document.body.appendChild(link);
+		link.click();
+		document.body.removeChild(link);
+	}
+
+	$effect(() => {
+		if (selectedSegmentIndex >= visibleSegments.length) {
+			selectedSegmentIndex = visibleSegments.length > 0 ? visibleSegments.length - 1 : 0;
+		}
+	});
+
+	$effect(() => {
+		if (!pendingSegmentId) return;
+		const idx = visibleSegments.findIndex((segment) => segment.id === pendingSegmentId);
+		if (idx >= 0) {
+			selectedSegmentIndex = idx;
+			pendingSegmentId = null;
+		}
+	});
 </script>
 
-<div class="flex min-h-screen flex-col bg-slate-950 text-slate-100 md:grid md:grid-cols-[320px_1fr]">
-	<aside class="border-b border-slate-800 bg-slate-900/80 backdrop-blur md:border-b-0 md:border-r">
+<div class="flex min-h-screen flex-col bg-slate-50 text-slate-900 md:grid md:grid-cols-[320px_1fr]">
+	<aside class="border-b border-slate-200 bg-white/90 backdrop-blur md:border-b-0 md:border-r">
 		<div class="flex h-full flex-col gap-4 p-6">
 			<div>
 				<h1 class="text-2xl font-semibold tracking-tight">Documents</h1>
-				<p class="mt-1 text-sm text-slate-400">Filter and choose a conversation to review.</p>
+				<p class="mt-1 text-sm text-slate-500">Filter and choose a conversation to review.</p>
 			</div>
 
-			<label class="input input-bordered flex items-center gap-2 bg-slate-900/50">
+			<label class="input input-bordered flex items-center gap-2 bg-white">
 				<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-5 w-5 opacity-70">
 					<path
 						fill-rule="evenodd"
@@ -123,7 +208,7 @@
 			</label>
 
 			{#if filteredDocuments.length === 0}
-				<div class="alert alert-warning bg-amber-500/10 text-amber-200">
+				<div class="alert alert-warning bg-amber-100 text-amber-900">
 					<span>No documents match that filter.</span>
 				</div>
 			{:else}
@@ -134,8 +219,8 @@
 								<button
 									type="button"
 									onclick={() => selectDocument(doc.id)}
-									class={`w-full rounded-2xl border border-slate-800 bg-slate-900/70 p-4 text-left transition hover:border-slate-600 hover:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500/60 ${
-										doc.id === selectedDocumentId ? 'border-sky-500/60 bg-slate-800/80 shadow-lg shadow-sky-900/30' : ''
+									class={`w-full rounded-2xl border border-slate-200 bg-white p-4 text-left transition hover:border-slate-400 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-sky-500/60 ${
+										doc.id === selectedDocumentId ? 'border-sky-400 bg-sky-50 shadow-lg shadow-sky-200/70' : ''
 									}`}
 									disabled={isLoadingDocument}
 								>
@@ -143,7 +228,7 @@
 										<span class="line-clamp-2 text-sm font-semibold tracking-tight">{doc.title}</span>
 										<span class="badge badge-outline badge-info uppercase">{doc.source_system}</span>
 									</div>
-									<div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+									<div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-600">
 										<span class="badge badge-sm badge-outline">{doc.segment_count} segments</span>
 										<span>Updated {formatDate(doc.updated_at)}</span>
 									</div>
@@ -169,12 +254,12 @@
 		{/if}
 
 		{#if selectedDocument}
-			<section class="card border border-slate-800 bg-slate-900/80 shadow-xl">
+			<section class="card border border-slate-200 bg-white shadow-xl">
 				<div class="card-body gap-6">
 					<div class="flex flex-col justify-between gap-6 lg:flex-row lg:items-start">
 						<div class="space-y-3">
 							<h2 class="card-title text-3xl font-semibold">{selectedDocument.document.title}</h2>
-							<div class="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+							<div class="flex flex-wrap items-center gap-3 text-xs text-slate-600">
 								<span class="badge badge-primary badge-outline uppercase">{selectedDocument.document.source_system}</span>
 								<span class="badge badge-outline">Segments: {selectedDocument.segments.length}</span>
 								{#if selectedDocument.keywords.length}
@@ -182,22 +267,36 @@
 								{/if}
 							</div>
 						</div>
-						<div class="grid gap-2 text-sm text-slate-300">
-							<span><strong class="font-semibold text-slate-100">Created:</strong> {formatDate(selectedDocument.document.created_at)}</span>
-							<span><strong class="font-semibold text-slate-100">Updated:</strong> {formatDate(selectedDocument.document.updated_at)}</span>
-							<span><strong class="font-semibold text-slate-100">Ingested:</strong> {formatDate(selectedDocument.version.ingested_at)}</span>
+						<div class="grid gap-2 text-sm text-slate-600">
+							<span><strong class="font-semibold text-slate-900">Created:</strong> {formatDate(selectedDocument.document.created_at)}</span>
+							<span><strong class="font-semibold text-slate-900">Updated:</strong> {formatDate(selectedDocument.document.updated_at)}</span>
+							<span><strong class="font-semibold text-slate-900">Ingested:</strong> {formatDate(selectedDocument.version.ingested_at)}</span>
 						</div>
 					</div>
 
+					<div class="flex flex-wrap items-center gap-3">
+						<button
+							class="btn btn-sm btn-outline"
+							onclick={() => (showEmptySegments = !showEmptySegments)}
+						>
+							{showEmptySegments ? 'Hide empty segments' : 'Show all segments'}
+						</button>
+						{#if hiddenSegmentCount > 0 && !showEmptySegments}
+							<span class="text-xs text-slate-500">
+								Hiding {hiddenSegmentCount} empty segment{hiddenSegmentCount === 1 ? '' : 's'}
+							</span>
+						{/if}
+					</div>
+
 					{#if selectedDocument.document.summary}
-						<p class="rounded-2xl border border-slate-800/70 bg-slate-950/50 p-4 leading-relaxed text-slate-200">
+						<p class="rounded-2xl border border-slate-200 bg-slate-50 p-4 leading-relaxed text-slate-700">
 							{selectedDocument.document.summary}
 						</p>
 					{/if}
 
 					{#if selectedDocument.keywords.length}
 						<div>
-							<h3 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Keywords</h3>
+							<h3 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Keywords</h3>
 							<div class="mt-2 flex flex-wrap gap-2">
 								{#each selectedDocument.keywords as keyword}
 									<span class="badge badge-success badge-outline">{keyword.term}</span>
@@ -208,26 +307,85 @@
 				</div>
 			</section>
 
+			<section class="card border border-slate-200 bg-white shadow-xl">
+				<div class="card-body space-y-4">
+					<div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+						<div>
+							<h3 class="text-xl font-semibold">Full conversation transcript</h3>
+							<p class="text-sm text-slate-500">
+								View every segment together or download a Markdown copy for sharing.
+							</p>
+						</div>
+						<div class="flex flex-wrap gap-2">
+							<button
+								type="button"
+								class="btn btn-sm btn-primary"
+								onclick={() => loadTranscript(transcript?.document.id === selectedDocumentId)}
+								disabled={!selectedDocumentId || isTranscriptLoading}
+							>
+								{transcript && transcript.document.id === selectedDocumentId ? 'Refresh transcript' : 'Load transcript'}
+							</button>
+							{#if transcriptDownloadUrl}
+								<a
+									class="btn btn-sm btn-outline"
+									href={transcriptDownloadUrl}
+									target="_blank"
+									rel="noreferrer"
+								>
+									Download Markdown
+								</a>
+							{:else}
+								<button class="btn btn-sm btn-outline" disabled>Download Markdown</button>
+							{/if}
+						</div>
+					</div>
+
+					{#if isTranscriptLoading}
+						<div class="alert alert-info bg-slate-50 text-slate-600">
+							<span>Loading transcript…</span>
+						</div>
+					{:else if transcriptError}
+						<div class="alert alert-error bg-slate-50 text-slate-600">
+							<span>{transcriptError}</span>
+						</div>
+					{:else if transcript && transcript.document.id === selectedDocumentId}
+						<div class="markdown prose max-w-none rounded-2xl border border-slate-200 bg-white p-4">
+							{@html renderMarkdown(transcript.markdown)}
+						</div>
+					{:else}
+						<p class="text-sm text-slate-500">Load the transcript to render the entire conversation in order.</p>
+					{/if}
+				</div>
+			</section>
+
 			{#if currentSegment}
 				<section class="space-y-4">
-					<div class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-900/80 px-4 py-3">
+					<div class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3">
 						<button type="button" class="btn btn-sm btn-outline" onclick={previousSegment} disabled={selectedSegmentIndex === 0}>
 							← Previous
 						</button>
-						<span class="text-sm text-slate-300">Segment {selectedSegmentIndex + 1} of {segments.length}</span>
+						<span class="text-sm text-slate-600">
+							Segment {visibleSegments.length ? selectedSegmentIndex + 1 : 0} of {visibleSegments.length}
+						</span>
 						<button
 							type="button"
 							class="btn btn-sm btn-outline"
 							onclick={nextSegment}
-							disabled={selectedSegmentIndex >= segments.length - 1}
+							disabled={selectedSegmentIndex >= visibleSegments.length - 1}
 						>
 							Next →
 						</button>
 					</div>
 
-					<div class="card border border-slate-800 bg-slate-900/80 shadow-lg">
-						<div class="card-body space-y-6">
-							<header class="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-300">
+					<div
+						class="card border border-slate-200 bg-white shadow-lg"
+						oncontextmenu={(event) => {
+							event.preventDefault();
+							if (currentSegment) downloadSegment(currentSegment.id);
+						}}
+					>
+						<div class={`card-body space-y-6 ${currentSegment ? segmentAccentClass(currentSegment.source_role) : ''}`}>
+							<header class="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-600">
 								<span
 									class={`badge badge-lg border-none px-4 py-1 text-sm font-semibold uppercase tracking-wide ${
 										currentSegment.source_role === 'assistant'
@@ -239,7 +397,10 @@
 								>
 									{roleLabel(currentSegment.source_role)}
 								</span>
-								<span>{formatDate(currentSegment.started_at)} · {currentSegment.segment_type}</span>
+								<div class="flex flex-wrap items-center gap-2">
+									<span>{formatDate(currentSegment.started_at)} · {currentSegment.segment_type}</span>
+									<button class="btn btn-xs btn-outline" onclick={() => downloadSegment(currentSegment.id)}>Export</button>
+								</div>
 							</header>
 
 							<div class="markdown">
@@ -249,7 +410,7 @@
 							{#if currentSegment.blocks.length > 1}
 								<div class="space-y-4">
 									{#each currentSegment.blocks as block}
-										<div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+										<div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
 											<div class="flex flex-wrap items-center gap-2 text-xs">
 												<span class="badge badge-outline">{blockLabelType(block.block_type)}</span>
 												{#if block.language}
@@ -257,7 +418,7 @@
 												{/if}
 											</div>
 											{#if block.block_type === 'code'}
-												<pre class="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80 p-4 text-sm leading-relaxed text-slate-100"><code>{block.body}</code></pre>
+												<pre class="overflow-x-auto rounded-xl border border-slate-200 bg-slate-100 p-4 text-sm leading-relaxed text-slate-900"><code>{block.body}</code></pre>
 											{:else}
 												<div class="markdown">
 													{@html renderMarkdown(block.body)}
@@ -269,15 +430,15 @@
 							{/if}
 
 							{#if currentSegment.assets.length}
-								<div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-									<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Attachments</h4>
+								<div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+									<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Attachments</h4>
 									<ul class="space-y-2">
 										{#each currentSegment.assets as asset}
-											<li class="flex flex-wrap items-center gap-3 rounded-xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 text-sm">
+											<li class="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
 												<span class="badge badge-outline badge-info">{asset.asset_type}</span>
-												<span class="font-semibold text-slate-100">{asset.file_name ?? 'Unnamed asset'}</span>
+												<span class="font-semibold text-slate-900">{asset.file_name ?? 'Unnamed asset'}</span>
 												{#if asset.mime_type}
-													<span class="text-xs text-slate-400">({asset.mime_type})</span>
+													<span class="text-xs text-slate-500">({asset.mime_type})</span>
 												{/if}
 												{#if asset.size_bytes}
 													<span class="text-xs text-slate-500">· {asset.size_bytes} bytes</span>
@@ -291,12 +452,12 @@
 					</div>
 				</section>
 			{:else}
-				<div class="alert alert-info bg-slate-900/80 text-slate-200">
-					<span>This document has no segments.</span>
+				<div class="alert alert-info bg-slate-50 text-slate-600">
+					<span>No segments to display. Try showing empty segments or pick another document.</span>
 				</div>
 			{/if}
 		{:else}
-			<div class="alert alert-info bg-slate-900/80 text-slate-200">
+			<div class="alert alert-info bg-slate-50 text-slate-600">
 				<span>Select a document to begin.</span>
 			</div>
 		{/if}

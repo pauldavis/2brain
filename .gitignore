@@ -121,3 +121,15 @@ pip-wheel-metadata/
 
 # Cython debug symbols
 cython_debug/
+
+# JavaScript / Svelte build artefacts
+node_modules/
+.vite/
+.svelte-kit/
+dist/
+build/
+*.log
+
+# Editor/OS cruft
+.DS_Store
+.vscode/

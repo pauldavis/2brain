@@ -3,29 +3,60 @@
 
 @layer base {
   body {
-    @apply bg-slate-950 text-slate-100;
+    @apply bg-slate-50 text-slate-900;
   }
 }
 
 @layer components {
   .markdown {
-    @apply space-y-4 text-slate-100;
+    @apply space-y-4 text-slate-900 leading-relaxed;
   }
 
   .markdown p {
     @apply leading-relaxed;
   }
 
+  .markdown h1,
+  .markdown h2,
+  .markdown h3,
+  .markdown h4 {
+    @apply font-semibold text-slate-900 mt-6;
+  }
+
+  .markdown h1 {
+    @apply text-3xl;
+  }
+
+  .markdown h2 {
+    @apply text-2xl;
+  }
+
+  .markdown h3 {
+    @apply text-xl;
+  }
+
+  .markdown blockquote {
+    @apply border-l-4 border-slate-200 bg-slate-100/70 px-4 py-2 italic text-slate-700;
+  }
+
+  .markdown code {
+    @apply rounded bg-slate-100 px-1 py-0.5 font-mono text-rose-600;
+  }
+
+  .markdown pre {
+    @apply rounded-2xl border border-slate-200 bg-slate-950/5 p-4 text-sm overflow-x-auto;
+  }
+
   .markdown strong {
-    @apply text-slate-50;
+    @apply text-slate-950;
   }
 
   .markdown em {
-    @apply text-pink-200;
+    @apply text-rose-600;
   }
 
   .markdown a {
-    @apply text-sky-300 underline decoration-sky-500/50 underline-offset-4;
+    @apply text-sky-600 underline decoration-sky-500/50 underline-offset-4;
   }
 
   .markdown ul {
