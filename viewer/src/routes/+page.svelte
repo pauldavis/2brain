@@ -50,6 +50,19 @@
 		return dateFormatter.format(new Date(value));
 	}
 
+	function formatBytes(value?: number | null) {
+		if (!value) return null;
+		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+		let unitIndex = 0;
+		let current = value;
+		while (current >= 1024 && unitIndex < units.length - 1) {
+			current /= 1024;
+			unitIndex += 1;
+		}
+		const precision = unitIndex === 0 ? 0 : 1;
+		return `${current.toFixed(precision)} ${units[unitIndex]}`;
+	}
+
 	async function selectDocument(id: string, segmentId?: string | null) {
 		if (id === selectedDocumentId) return;
 		isLoadingDocument = true;
@@ -164,6 +177,15 @@
 		document.body.appendChild(link);
 		link.click();
 		document.body.removeChild(link);
+	}
+
+	function attachmentUrl(asset: SegmentAsset, download = false) {
+		if (!asset.attachment_id) return null;
+		return `${API_BASE}/attachments/${asset.attachment_id}${download ? '?download=1' : ''}`;
+	}
+
+	function isImageAsset(asset: SegmentAsset) {
+		return Boolean(asset.mime_type && asset.mime_type.startsWith('image'));
 	}
 
 	$effect(() => {
@@ -432,16 +454,46 @@
 							{#if currentSegment.assets.length}
 								<div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
 									<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Attachments</h4>
-									<ul class="space-y-2">
+									<ul class="space-y-3">
 										{#each currentSegment.assets as asset}
-											<li class="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm">
-												<span class="badge badge-outline badge-info">{asset.asset_type}</span>
-												<span class="font-semibold text-slate-900">{asset.file_name ?? 'Unnamed asset'}</span>
-												{#if asset.mime_type}
-													<span class="text-xs text-slate-500">({asset.mime_type})</span>
-												{/if}
-												{#if asset.size_bytes}
-													<span class="text-xs text-slate-500">· {asset.size_bytes} bytes</span>
+											<li class="space-y-3 rounded-xl border border-slate-200 bg-white p-3 text-sm">
+												<div class="flex flex-wrap items-center justify-between gap-3">
+													<div class="flex flex-wrap items-center gap-2">
+														<span class="badge badge-outline badge-info">{asset.asset_type}</span>
+														<span class="font-semibold text-slate-900">{asset.file_name ?? 'Unnamed asset'}</span>
+														{#if asset.mime_type}
+															<span class="text-xs text-slate-500">({asset.mime_type})</span>
+														{/if}
+														{#if formatBytes(asset.size_bytes)}
+															<span class="text-xs text-slate-500">· {formatBytes(asset.size_bytes)}</span>
+														{/if}
+													</div>
+													<div class="flex flex-wrap gap-2">
+														{#if asset.has_content}
+															<a
+																class="btn btn-xs btn-outline"
+																href={attachmentUrl(asset, true) ?? '#'}
+																target="_blank"
+																rel="noreferrer"
+															>
+																Download
+															</a>
+														{/if}
+													</div>
+												</div>
+												{#if asset.has_content}
+													{#if isImageAsset(asset)}
+														<img
+															src={attachmentUrl(asset) ?? ''}
+															alt={asset.file_name ?? 'Attachment preview'}
+															class="w-full max-h-[360px] rounded-lg border border-slate-200 bg-white object-contain"
+															loading="lazy"
+														/>
+													{:else}
+														<p class="text-xs text-slate-500">Preview not available. Use the download button to view this attachment.</p>
+													{/if}
+												{:else}
+													<p class="text-xs text-slate-500">Content not available for this attachment.</p>
 												{/if}
 											</li>
 										{/each}

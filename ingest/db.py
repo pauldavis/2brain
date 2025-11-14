@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import string
 from datetime import datetime
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import psycopg
@@ -10,6 +11,15 @@ from psycopg.types.json import Json
 from ingest.models import SegmentInput
 
 QUALITY_NOISE_THRESHOLD = 0.2
+
+
+def _read_asset_bytes(local_path: str | None) -> bytes | None:
+    if not local_path:
+        return None
+    try:
+        return Path(local_path).read_bytes()
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def estimate_segment_quality(markdown: str, plaintext: str) -> tuple[float, bool]:
@@ -109,7 +119,10 @@ def persist_document(
                 Json(raw_metadata),
             ),
         )
-        document_id = cur.fetchone()[0]
+        document_row = cur.fetchone()
+        if document_row is None:
+            raise RuntimeError("Failed to insert or update document record.")
+        document_id = document_row[0]
 
         cur.execute(
             """
@@ -138,7 +151,11 @@ def persist_document(
 
         node_to_segment_id: dict[str, str] = {}
         for segment in segments:
-            parent_segment_id = node_to_segment_id.get(segment.parent_node_id)
+            parent_segment_id = (
+                node_to_segment_id.get(segment.parent_node_id)
+                if segment.parent_node_id
+                else None
+            )
             auto_score, auto_noise = estimate_segment_quality(
                 segment.content_markdown,
                 segment.plaintext,
@@ -194,7 +211,10 @@ def persist_document(
                     segment.raw_reference,
                 ),
             )
-            segment_id = cur.fetchone()[0]
+            segment_row = cur.fetchone()
+            if segment_row is None:
+                raise RuntimeError("Failed to insert segment record.")
+            segment_id = segment_row[0]
             node_to_segment_id[segment.node_id] = segment_id
 
             for index, block in enumerate(segment.blocks, start=1):
@@ -221,27 +241,51 @@ def persist_document(
                 )
 
             for asset in segment.assets:
+                content_bytes = _read_asset_bytes(asset.local_path)
+                size_bytes = asset.size_bytes
+                if content_bytes is not None and size_bytes is None:
+                    size_bytes = len(content_bytes)
+
+                cur.execute(
+                    """
+                    INSERT INTO attachments (
+                        file_name,
+                        mime_type,
+                        size_bytes,
+                        local_path,
+                        source_reference,
+                        content
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        asset.file_name,
+                        asset.mime_type,
+                        size_bytes,
+                        asset.local_path,
+                        asset.source_reference,
+                        content_bytes,
+                    ),
+                )
+                attachment_row = cur.fetchone()
+                if attachment_row is None:
+                    raise RuntimeError("Failed to create attachment record.")
+                attachment_id = attachment_row[0]
+
                 cur.execute(
                     """
                     INSERT INTO segment_assets (
                         segment_id,
                         asset_type,
-                        file_name,
-                        mime_type,
-                        size_bytes,
-                        local_path,
-                        source_reference
+                        attachment_id
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s)
                     """,
                     (
                         segment_id,
                         asset.asset_type,
-                        asset.file_name,
-                        asset.mime_type,
-                        asset.size_bytes,
-                        asset.local_path,
-                        asset.source_reference,
+                        attachment_id,
                     ),
                 )
     return True

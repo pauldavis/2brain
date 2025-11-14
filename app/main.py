@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import documents, search, stats
+from app.routes import attachments, documents, search, stats
 
 app = FastAPI(
     title="2brain Document Service",
@@ -19,5 +19,6 @@ app.add_middleware(
 )
 
 app.include_router(documents.router)
+app.include_router(attachments.router)
 app.include_router(search.router)
 app.include_router(stats.router)

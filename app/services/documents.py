@@ -79,15 +79,16 @@ LEFT JOIN LATERAL (
         jsonb_build_object(
             'id', sa.id,
             'asset_type', sa.asset_type,
-            'file_name', sa.file_name,
-            'mime_type', sa.mime_type,
-            'size_bytes', sa.size_bytes,
-            'local_path', sa.local_path,
-            'source_reference', sa.source_reference,
-            'created_at', sa.created_at
+            'attachment_id', att.id,
+            'file_name', att.file_name,
+            'mime_type', att.mime_type,
+            'size_bytes', att.size_bytes,
+            'created_at', sa.created_at,
+            'has_content', att.content IS NOT NULL
         ) ORDER BY sa.created_at, sa.id
     ) AS assets
     FROM segment_assets sa
+    JOIN attachments att ON att.id = sa.attachment_id
     WHERE sa.segment_id = ds.id
 ) AS assets ON TRUE
 LEFT JOIN LATERAL (
@@ -345,15 +346,16 @@ LEFT JOIN LATERAL (
         jsonb_build_object(
             'id', sa.id,
             'asset_type', sa.asset_type,
-            'file_name', sa.file_name,
-            'mime_type', sa.mime_type,
-            'size_bytes', sa.size_bytes,
-            'local_path', sa.local_path,
-            'source_reference', sa.source_reference,
-            'created_at', sa.created_at
+            'attachment_id', att.id,
+            'file_name', att.file_name,
+            'mime_type', att.mime_type,
+            'size_bytes', att.size_bytes,
+            'created_at', sa.created_at,
+            'has_content', att.content IS NOT NULL
         ) ORDER BY sa.created_at, sa.id
     ) AS assets
     FROM segment_assets sa
+    JOIN attachments att ON att.id = sa.attachment_id
     WHERE sa.segment_id = ds.id
 ) AS assets ON TRUE
 LEFT JOIN LATERAL (

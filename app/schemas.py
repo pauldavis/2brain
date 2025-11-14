@@ -38,12 +38,12 @@ class SegmentBlock(BaseModel):
 class SegmentAsset(BaseModel):
     id: UUID
     asset_type: str
+    attachment_id: UUID
     file_name: Optional[str] = None
     mime_type: Optional[str] = None
     size_bytes: Optional[int] = None
-    local_path: Optional[str] = None
-    source_reference: Optional[str] = None
     created_at: datetime
+    has_content: bool = False
 
 
 class SegmentAnnotation(BaseModel):

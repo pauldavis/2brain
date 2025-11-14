@@ -16,7 +16,7 @@ class SegmentBlockInput:
 @dataclass
 class SegmentAssetInput:
     asset_type: str
-    source_reference: str
+    source_reference: Optional[str] = None
     file_name: Optional[str] = None
     mime_type: Optional[str] = None
     size_bytes: Optional[int] = None
