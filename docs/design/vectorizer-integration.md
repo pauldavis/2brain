@@ -30,7 +30,9 @@
 - [x] Ensure downstream search paths filter `is_noise = FALSE` and `embedding_status = 'ready'` (`app/services/search.py`).
 - [ ] Follow-up enhancements:
   - [x] Build partial BM25 index on `document_segments` (`WHERE is_noise = FALSE AND embedding_status = 'ready'`) for hybrid ranking (`db/bm25_document_segments.sql`).
+  - [x] Add an IVFFlat vector index for `document_segments.embedding` to accelerate the semantic leg of hybrid search (`db/vector_index_document_segments.sql`).
   - [ ] Add a maintenance job that nulls embeddings + re-enqueues segments when `quality_score` changes materially.
+  - [x] Expose `IVFFLAT_PROBES` application setting so hybrid search always sets an appropriate probe count on every connection.
 
 ## BM25 Index Creation (final form)
 
@@ -149,3 +151,14 @@ LIMIT 20;
 ```
 
 > **Timescale Cloud note:** If `ai.*` objects are missing, install pgai once from the Console or CLI, then rerun the vectorizer SQL.
+
+## Vector Index Creation
+
+- Use the helper in `db/vector_index_document_segments.sql` to build `document_segments_embedding_ivf_idx` once the `vector` extension is available.
+- After the index is built, run `ANALYZE public.document_segments;` so the planner is aware of the new access path.
+- Set `SET ivfflat.probes = 10;` (or tune higher) in hybrid-search sessions to trade recall for latency.
+
+### Application configuration
+
+- The API automatically issues `SET ivfflat.probes = <value>` for every connection when `IVFFLAT_PROBES` is present in the environment (defaults to 10 when unset).
+- Raise `IVFFLAT_PROBES` if you notice recall dropping after adding more data or if you increase `k` in the hybrid query.

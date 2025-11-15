@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
-	import type { DocumentSummary, DocumentTranscript, DocumentView, Segment } from '$lib/types';
+	import type { DocumentSummary, DocumentTranscript, DocumentView, Segment, SegmentAsset } from '$lib/types';
 	import { marked } from 'marked';
 
 	const props = $props<{ data: PageData }>();
@@ -20,7 +20,16 @@
 	let isLoadingDocument = $state(false);
 	let loadError = $state('');
 
-	const segments = $derived<Segment[]>(selectedDocument?.segments ?? []);
+	const segments = $derived<Segment[]>(
+		[...(selectedDocument?.segments ?? [])].sort((a, b) => {
+			const aTime = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+			const bTime = b.started_at ? new Date(b.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+			if (aTime !== bTime) {
+				return aTime - bTime;
+			}
+			return a.sequence - b.sequence;
+		})
+	);
 	let showEmptySegments = $state(true);
 	let pendingSegmentId = $state<string | null>(data.initialSegmentId ?? null);
 	const visibleSegments = $derived<Segment[]>(
@@ -116,13 +125,23 @@
 		selectedSegmentIndex = Math.min(visibleSegments.length - 1, selectedSegmentIndex + 1);
 	}
 
+	function firstSegment() {
+		if (!selectedDocument || visibleSegments.length === 0) return;
+		selectedSegmentIndex = 0;
+	}
+
+	function lastSegment() {
+		if (!selectedDocument || visibleSegments.length === 0) return;
+		selectedSegmentIndex = visibleSegments.length - 1;
+	}
+
 	marked.setOptions({ breaks: true, gfm: true });
 	const markdownCache = new Map<string, string>();
 	function renderMarkdown(text: string) {
 		if (!text) return '';
 		const cached = markdownCache.get(text);
 		if (cached) return cached;
-		const html = marked.parse(text);
+		const html = marked.parse(text) as string;
 		markdownCache.set(text, html);
 		return html;
 	}
@@ -186,6 +205,60 @@
 
 	function isImageAsset(asset: SegmentAsset) {
 		return Boolean(asset.mime_type && asset.mime_type.startsWith('image'));
+	}
+
+	type CodeFence = {
+		language: string | null;
+		content: string;
+	};
+
+	function normalizeFenceLanguage(language: string | null): string {
+		if (!language) return 'PLAINTEXT';
+		const lower = language.toLowerCase();
+		if (lower === 'jsonc' || lower === 'json') return 'JSON';
+		if (lower === 'mermaid') return 'MERMAID';
+		return lower.toUpperCase();
+	}
+
+	function extractCodeFences(markdown?: string | null): CodeFence[] {
+		if (!markdown) return [];
+		const fences: CodeFence[] = [];
+		const regex = /```([\w-]+)?\s*\n([\s\S]*?)```/g;
+		let match: RegExpExecArray | null;
+		// eslint-disable-next-line no-cond-assign
+		while ((match = regex.exec(markdown))) {
+			const language = (match[1] || '').trim() || null;
+			const content = (match[2] || '').trimEnd();
+			if (content) {
+				fences.push({ language, content });
+			}
+		}
+		return fences;
+	}
+
+	const codeFences = $derived(extractCodeFences(currentSegment?.content_markdown ?? null));
+	const hasDetailedBlocks = $derived(() =>
+		(currentSegment?.blocks ?? []).some((block) => block.block_type !== 'markdown')
+	);
+
+	async function copyCodeToClipboard(code: string) {
+		try {
+			await navigator.clipboard.writeText(code);
+		} catch (error) {
+			console.error('Failed to copy code', error);
+		}
+	}
+
+	function downloadCode(code: string, fileName = 'snippet.txt') {
+		const blob = new Blob([code], { type: 'text/plain' });
+		const blobUrl = URL.createObjectURL(blob);
+		const link = document.createElement('a');
+		link.href = blobUrl;
+		link.download = fileName;
+		document.body.appendChild(link);
+		link.click();
+		document.body.removeChild(link);
+		URL.revokeObjectURL(blobUrl);
 	}
 
 	$effect(() => {
@@ -383,23 +456,39 @@
 			{#if currentSegment}
 				<section class="space-y-4">
 					<div class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3">
-						<button type="button" class="btn btn-sm btn-outline" onclick={previousSegment} disabled={selectedSegmentIndex === 0}>
-							← Previous
-						</button>
+						<div class="flex flex-wrap gap-2">
+							<button type="button" class="btn btn-sm btn-outline" onclick={firstSegment} disabled={selectedSegmentIndex === 0}>
+								⤒ First
+							</button>
+							<button type="button" class="btn btn-sm btn-outline" onclick={previousSegment} disabled={selectedSegmentIndex === 0}>
+								← Previous
+							</button>
+						</div>
 						<span class="text-sm text-slate-600">
 							Segment {visibleSegments.length ? selectedSegmentIndex + 1 : 0} of {visibleSegments.length}
 						</span>
-						<button
-							type="button"
-							class="btn btn-sm btn-outline"
-							onclick={nextSegment}
-							disabled={selectedSegmentIndex >= visibleSegments.length - 1}
-						>
-							Next →
-						</button>
+						<div class="flex flex-wrap gap-2">
+							<button
+								type="button"
+								class="btn btn-sm btn-outline"
+								onclick={nextSegment}
+								disabled={selectedSegmentIndex >= visibleSegments.length - 1}
+							>
+								Next →
+							</button>
+							<button
+								type="button"
+								class="btn btn-sm btn-outline"
+								onclick={lastSegment}
+								disabled={selectedSegmentIndex >= visibleSegments.length - 1}
+							>
+								Last ⤓
+							</button>
+						</div>
 					</div>
 
 					<div
+						role="group"
 						class="card border border-slate-200 bg-white shadow-lg"
 						oncontextmenu={(event) => {
 							event.preventDefault();
@@ -429,9 +518,10 @@
 								{@html renderMarkdown(currentSegment.content_markdown)}
 							</div>
 
-							{#if currentSegment.blocks.length > 1}
+							{#if hasDetailedBlocks}
 								<div class="space-y-4">
 									{#each currentSegment.blocks as block}
+										{#if block.block_type !== 'markdown'}
 										<div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
 											<div class="flex flex-wrap items-center gap-2 text-xs">
 												<span class="badge badge-outline">{blockLabelType(block.block_type)}</span>
@@ -440,12 +530,54 @@
 												{/if}
 											</div>
 											{#if block.block_type === 'code'}
+												<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+													<span>{normalizeFenceLanguage(block.language ?? null)} block</span>
+													<div class="flex flex-wrap gap-2">
+														<button class="btn btn-xs btn-outline" onclick={() => copyCodeToClipboard(block.body)}>
+															Copy
+														</button>
+														<button
+															class="btn btn-xs btn-outline"
+															onclick={() => downloadCode(block.body, `segment-${currentSegment.sequence}-code-block-${block.sequence}.txt`)}
+														>
+															Download
+														</button>
+													</div>
+												</div>
 												<pre class="overflow-x-auto rounded-xl border border-slate-200 bg-slate-100 p-4 text-sm leading-relaxed text-slate-900"><code>{block.body}</code></pre>
 											{:else}
 												<div class="markdown">
 													{@html renderMarkdown(block.body)}
 												</div>
 											{/if}
+										</div>
+										{/if}
+									{/each}
+								</div>
+							{/if}
+
+							{#if codeFences.length}
+								<div class="space-y-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+									<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Code snippets</h4>
+									{#each codeFences as fence, index}
+										<div class="space-y-2 rounded-2xl border border-slate-200 bg-white p-4">
+											<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+												<span>{normalizeFenceLanguage(fence.language)} snippet {index + 1}</span>
+												<div class="flex flex-wrap gap-2">
+													<button class="btn btn-xs btn-outline" onclick={() => copyCodeToClipboard(fence.content)}>
+														Copy
+													</button>
+													<button
+														class="btn btn-xs btn-outline"
+														onclick={() => downloadCode(fence.content, `segment-${currentSegment.sequence}-code-${index + 1}.txt`)}
+													>
+														Download
+													</button>
+												</div>
+											</div>
+											<pre class="overflow-x-auto rounded-xl border border-slate-200 bg-slate-100 p-4 text-sm leading-relaxed text-slate-900">
+												<code>{fence.content}</code>
+											</pre>
 										</div>
 									{/each}
 								</div>

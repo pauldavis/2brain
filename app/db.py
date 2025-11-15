@@ -15,6 +15,10 @@ def connection() -> Generator[psycopg.Connection, None, None]:
     settings = get_settings()
     conn = psycopg.connect(settings.database_url)
     conn.row_factory = dict_row
+    probes = getattr(settings, "ivfflat_probes", None)
+    if probes:
+        with conn.cursor() as cur:
+            cur.execute(f"SET ivfflat.probes = {int(probes)}")
     try:
         yield conn
     finally:

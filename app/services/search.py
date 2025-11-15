@@ -118,19 +118,31 @@ LIMIT %(limit)s OFFSET %(offset)s;
 
 RRF_SQL = """
 WITH bm AS (
-  SELECT ds.id AS segment_id,
-         ROW_NUMBER() OVER (
-           ORDER BY ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx')
-         ) AS r
-  FROM public.document_segments ds
+  SELECT segment_id,
+         ROW_NUMBER() OVER (ORDER BY score) AS r
+  FROM (
+    SELECT ds.id AS segment_id,
+           ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx') AS score
+    FROM public.document_segments ds
+    WHERE ds.embedding_status = 'ready'
+      AND ds.is_noise = FALSE
+    ORDER BY score
+    LIMIT %(k)s
+  ) ranked
 ),
 vec AS (
-  SELECT ds.id AS segment_id,
-         ROW_NUMBER() OVER (
-           ORDER BY ds.embedding <=> %(qvec)s::vector
-         ) AS r
-  FROM public.document_segments ds
-  WHERE ds.embedding IS NOT NULL
+  SELECT segment_id,
+         ROW_NUMBER() OVER (ORDER BY dist) AS r
+  FROM (
+    SELECT ds.id AS segment_id,
+           ds.embedding <=> %(qvec)s::vector AS dist
+    FROM public.document_segments ds
+    WHERE ds.embedding IS NOT NULL
+      AND ds.embedding_status = 'ready'
+      AND ds.is_noise = FALSE
+    ORDER BY dist
+    LIMIT %(k)s
+  ) ranked
 ),
 scores AS (
   SELECT segment_id,
@@ -165,6 +177,8 @@ JOIN LATERAL (
     FROM document_segments ds_all
     WHERE ds_all.document_version_id = dv.id
 ) stats ON TRUE
+WHERE ds.embedding_status = 'ready'
+  AND ds.is_noise = FALSE
 ORDER BY sc.score DESC
 LIMIT %(limit)s OFFSET %(offset)s;
 """

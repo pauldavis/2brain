@@ -23,6 +23,16 @@ class Settings:
             )
         self.database_url = database_url
 
+        probes = os.environ.get("IVFFLAT_PROBES", "").strip()
+        if probes:
+            try:
+                parsed = int(probes)
+            except ValueError as exc:  # pragma: no cover - defensive config guard
+                raise RuntimeError("IVFFLAT_PROBES must be an integer") from exc
+            self.ivfflat_probes = parsed if parsed > 0 else None
+        else:
+            self.ivfflat_probes = 10
+
 
 @lru_cache()
 def get_settings() -> Settings:
