@@ -71,3 +71,7 @@
     @apply leading-relaxed;
   }
 }
+
+.code-block code .code-keyword {
+  @apply text-sky-600 font-semibold;
+}

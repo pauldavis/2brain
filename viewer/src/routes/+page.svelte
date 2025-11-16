@@ -19,7 +19,9 @@
 	let selectedSegmentIndex = $state(0);
 	let isLoadingDocument = $state(false);
 	let loadError = $state('');
-
+	type ViewMode = 'document' | 'sections';
+	let viewMode = $state<ViewMode>('sections');
+	let sidebarOpen = $state(true);
 	const segments = $derived<Segment[]>(
 		[...(selectedDocument?.segments ?? [])].sort((a, b) => {
 			const aTime = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
@@ -30,14 +32,16 @@
 			return a.sequence - b.sequence;
 		})
 	);
-	let showEmptySegments = $state(true);
+	let showEmptySegments = $state(false);
 	let pendingSegmentId = $state<string | null>(data.initialSegmentId ?? null);
 	const visibleSegments = $derived<Segment[]>(
 		showEmptySegments
 			? segments
 			: segments.filter((segment) => segmentHasContent(segment))
 	);
-	const hiddenSegmentCount = $derived(Math.max(0, segments.length - visibleSegments.length));
+	const emptySegmentCount = $derived(
+		selectedDocument ? segments.filter((segment) => !segmentHasContent(segment)).length : 0
+	);
 	const currentSegment = $derived<Segment | null>(visibleSegments[selectedSegmentIndex] ?? null);
 	let transcript = $state<DocumentTranscript | null>(null);
 	let transcriptError = $state('');
@@ -53,10 +57,71 @@
 		hour: '2-digit',
 		minute: '2-digit'
 	});
+	const shortDateFormatter = new Intl.DateTimeFormat('en-GB', {
+		day: '2-digit',
+		month: 'short',
+		year: 'numeric'
+	});
+	const numberFormatter = new Intl.NumberFormat();
 
 	function formatDate(value?: string | null) {
 		if (!value) return '—';
 		return dateFormatter.format(new Date(value));
+	}
+
+	function formatShortDate(value?: string | null) {
+		if (!value) return '—';
+		return shortDateFormatter.format(new Date(value));
+	}
+
+	function formatCharacterCount(value?: number | null) {
+		if (value === null || value === undefined) return null;
+		const numericValue = typeof value === 'number' ? value : Number(value);
+		if (Number.isNaN(numericValue)) return null;
+		return `${numberFormatter.format(numericValue)} characters`;
+	}
+
+	function formatSegmentCount(value?: number | null) {
+		if (value === null || value === undefined) return null;
+		const numericValue = typeof value === 'number' ? value : Number(value);
+		if (Number.isNaN(numericValue)) return null;
+		return `${numberFormatter.format(numericValue)} segments`;
+	}
+
+	const selectedDocumentCharCount = $derived(
+		selectedDocument
+			? selectedDocument.segments.reduce((total, segment) => {
+					const length = typeof segment.content_markdown === 'string' ? segment.content_markdown.length : 0;
+					return total + length;
+			  }, 0)
+			: null
+	);
+	const selectedDocumentCharLabel = $derived(formatCharacterCount(selectedDocumentCharCount));
+	const selectedDocumentSegmentLabel = $derived(
+		selectedDocument ? formatSegmentCount(selectedDocument.segments.length) : null
+	);
+
+	function sourceAccentClass(source?: string | null) {
+		switch ((source ?? '').toLowerCase()) {
+			case 'chatgpt':
+			case 'openai':
+				return 'border-l-sky-400';
+			case 'slack':
+				return 'border-l-amber-400';
+			case 'email':
+				return 'border-l-emerald-400';
+			case 'teams':
+				return 'border-l-fuchsia-400';
+			default:
+				return 'border-l-slate-400';
+		}
+	}
+
+	function documentDateTooltip(doc?: DocumentView | null) {
+		if (!doc) return '';
+		return `Created: ${formatDate(doc.document.created_at)}\nUpdated: ${formatDate(doc.document.updated_at)}\nIngested: ${formatDate(
+			doc.version.ingested_at
+		)}`;
 	}
 
 	function formatBytes(value?: number | null) {
@@ -81,12 +146,13 @@
 			if (!res.ok) {
 				throw new Error(`Failed to load document (${res.status})`);
 			}
-			const doc: DocumentView = await res.json();
-			selectedDocument = doc;
-			selectedSegmentIndex = 0;
-			pendingSegmentId = segmentId ?? null;
-			transcript = null;
-			transcriptError = '';
+				const doc: DocumentView = await res.json();
+				selectedDocument = doc;
+				selectedSegmentIndex = 0;
+				pendingSegmentId = segmentId ?? null;
+				transcript = null;
+				transcriptError = '';
+				viewMode = 'sections';
 		} catch (error) {
 			console.error(error);
 			loadError = error instanceof Error ? error.message : 'Unknown error while loading document.';
@@ -207,10 +273,9 @@
 		return Boolean(asset.mime_type && asset.mime_type.startsWith('image'));
 	}
 
-	type CodeFence = {
-		language: string | null;
-		content: string;
-	};
+	type SegmentContentPart =
+		| { kind: 'markdown'; content: string }
+		| { kind: 'code'; content: string; language: string | null; snippet: number };
 
 	function normalizeFenceLanguage(language: string | null): string {
 		if (!language) return 'PLAINTEXT';
@@ -220,26 +285,93 @@
 		return lower.toUpperCase();
 	}
 
-	function extractCodeFences(markdown?: string | null): CodeFence[] {
-		if (!markdown) return [];
-		const fences: CodeFence[] = [];
-		const regex = /```([\w-]+)?\s*\n([\s\S]*?)```/g;
-		let match: RegExpExecArray | null;
-		// eslint-disable-next-line no-cond-assign
-		while ((match = regex.exec(markdown))) {
-			const language = (match[1] || '').trim() || null;
-			const content = (match[2] || '').trimEnd();
-			if (content) {
-				fences.push({ language, content });
-			}
+	function dedentCode(raw: string, language: string | null): string {
+		// Drop leading/trailing blank lines first
+		let text = raw.replace(/^\s*\n/, '').replace(/\s*$/, '');
+
+		const lang = (language || '').toLowerCase();
+		// For plain text-ish blocks, just strip all leading indentation on every line
+		if (!lang || lang === 'text' || lang === 'plaintext') {
+			return text.replace(/^[\t ]+/gm, '');
 		}
-		return fences;
+
+		const lines = text.split('\n');
+		let minIndent: number | null = null;
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			const match = line.match(/^[\s\u00a0]*/); // any whitespace, including non-breaking
+			const indent = match ? match[0].length : 0;
+			minIndent = minIndent === null ? indent : Math.min(minIndent, indent);
+		}
+		if (minIndent === null || minIndent === 0) {
+			return text;
+		}
+		return lines
+			.map((line) => {
+				if (!line.trim()) return '';
+				return line.length >= minIndent ? line.slice(minIndent) : line.trimStart();
+			})
+			.join('\n');
 	}
 
-	const codeFences = $derived(extractCodeFences(currentSegment?.content_markdown ?? null));
+	function splitContent(markdown?: string | null): SegmentContentPart[] {
+		if (!markdown) return [];
+		const parts: SegmentContentPart[] = [];
+		const regex = /```([\w-]+)?\s*\n([\s\S]*?)```/g;
+		let match: RegExpExecArray | null;
+		let lastIndex = 0;
+		let snippetCounter = 0;
+		// eslint-disable-next-line no-cond-assign
+		while ((match = regex.exec(markdown))) {
+			const preceding = markdown.slice(lastIndex, match.index);
+			if (preceding.trim()) {
+				parts.push({ kind: 'markdown', content: preceding });
+			}
+			const language = (match[1] || '').trim() || null;
+			const rawContent = match[2] || '';
+			const content = dedentCode(rawContent, language);
+			if (content) {
+				parts.push({ kind: 'code', language, content, snippet: ++snippetCounter });
+			}
+			lastIndex = regex.lastIndex;
+		}
+		const remaining = markdown.slice(lastIndex);
+		if (remaining.trim()) {
+			parts.push({ kind: 'markdown', content: remaining });
+		}
+		if (!parts.length && markdown) {
+			parts.push({ kind: 'markdown', content: markdown });
+		}
+		return parts;
+	}
+
+	const segmentedContent = $derived(splitContent(currentSegment?.content_markdown ?? null));
 	const hasDetailedBlocks = $derived(() =>
 		(currentSegment?.blocks ?? []).some((block) => block.block_type !== 'markdown')
 	);
+
+	function escapeHtml(value: string): string {
+		return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+	}
+
+function highlightCode(value: string, language: string | null): string {
+	const escaped = escapeHtml(value);
+	const lang = (language || '').toLowerCase();
+	if (lang === 'sql') {
+			const keywords =
+				'SELECT|FROM|WHERE|GROUP\\s+BY|ORDER\\s+BY|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AS|AND|OR|NOT|NULL|VALUES|LIMIT|OFFSET|HAVING|DISTINCT|UNION|ALL';
+			const regex = new RegExp(`\\b(${keywords})\\b`, 'gi');
+			return escaped.replace(regex, '<span class="code-keyword">$1</span>');
+		}
+	return escaped;
+}
+
+function sanitizeSummary(raw: string): string {
+	const trimmed = raw.trim();
+	const overviewPrefix = /^\*\*Conversation Overview\*\*\s*/i;
+	const deduped = trimmed.replace(overviewPrefix, '');
+	return deduped.replace(/\*\*Tool Knowledge\*\*/, '\n\n**Tool Knowledge**');
+}
 
 	async function copyCodeToClipboard(code: string) {
 		try {
@@ -275,15 +407,37 @@
 			pendingSegmentId = null;
 		}
 	});
+
+	$effect(() => {
+		if (viewMode !== 'document') return;
+		if (!selectedDocumentId) return;
+		if (isTranscriptLoading) return;
+		if (transcript && transcript.document.id === selectedDocumentId) return;
+		loadTranscript(false);
+	});
 </script>
 
 <div class="flex min-h-screen flex-col bg-slate-50 text-slate-900 md:grid md:grid-cols-[320px_1fr]">
-	<aside class="border-b border-slate-200 bg-white/90 backdrop-blur md:border-b-0 md:border-r">
+	<aside
+		id="documents-sidebar"
+		class={`border-b border-slate-200 bg-white/90 backdrop-blur md:border-b-0 md:border-r ${
+			sidebarOpen ? 'block' : 'hidden'
+		} md:block`}
+	>
 		<div class="flex h-full flex-col gap-4 p-6">
-			<div>
+			<div class="flex items-start justify-between gap-3">
 				<h1 class="text-2xl font-semibold tracking-tight">Documents</h1>
-				<p class="mt-1 text-sm text-slate-500">Filter and choose a conversation to review.</p>
+				<button
+					type="button"
+					class="btn btn-ghost btn-xs md:hidden"
+					aria-controls="documents-sidebar"
+					aria-expanded={sidebarOpen}
+					onclick={() => (sidebarOpen = false)}
+				>
+					Hide
+				</button>
 			</div>
+			<p class="text-sm text-slate-500">Filter and choose a conversation to review.</p>
 
 			<label class="input input-bordered flex items-center gap-2 bg-white">
 				<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-5 w-5 opacity-70">
@@ -314,18 +468,24 @@
 								<button
 									type="button"
 									onclick={() => selectDocument(doc.id)}
-									class={`w-full rounded-2xl border border-slate-200 bg-white p-4 text-left transition hover:border-slate-400 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-sky-500/60 ${
-										doc.id === selectedDocumentId ? 'border-sky-400 bg-sky-50 shadow-lg shadow-sky-200/70' : ''
-									}`}
+										class={`w-full rounded-lg border border-slate-200 ${doc.id === selectedDocumentId ? 'border-l-10' : 'border-l-4'} ${sourceAccentClass(
+										doc.source_system
+									)} bg-white p-4 text-left transition hover:border-slate-400 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-sky-500/60`}
 									disabled={isLoadingDocument}
 								>
 									<div class="flex items-start justify-between gap-3">
 										<span class="line-clamp-2 text-sm font-semibold tracking-tight">{doc.title}</span>
-										<span class="badge badge-outline badge-info uppercase">{doc.source_system}</span>
 									</div>
 									<div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-600">
-										<span class="badge badge-sm badge-outline">{doc.segment_count} segments</span>
-										<span>Updated {formatDate(doc.updated_at)}</span>
+										{#if formatCharacterCount(doc.char_count)}
+											<span class="badge badge-sm badge-outline">{formatCharacterCount(doc.char_count)}</span>
+										{/if}
+										{#if formatSegmentCount(doc.segment_count)}
+											<span class="badge badge-sm badge-outline">{formatSegmentCount(doc.segment_count)}</span>
+										{/if}
+										<span class="text-slate-500" title={`Updated ${formatDate(doc.updated_at)}`}>
+											Updated {formatShortDate(doc.updated_at)}
+										</span>
 									</div>
 								</button>
 							</li>
@@ -337,6 +497,22 @@
 	</aside>
 
 	<main class="flex min-h-screen flex-col gap-6 overflow-y-auto p-6 lg:p-10">
+		<div class="flex flex-wrap items-center justify-between gap-3">
+			<a class="btn btn-outline btn-sm" href="/search">
+				<span aria-hidden="true">←</span>
+				Back to search
+			</a>
+			<button
+				type="button"
+				class="btn btn-ghost btn-sm md:hidden"
+				aria-controls="documents-sidebar"
+				aria-expanded={sidebarOpen}
+				onclick={() => (sidebarOpen = !sidebarOpen)}
+			>
+				{sidebarOpen ? 'Hide documents' : 'Show documents'}
+			</button>
+		</div>
+
 		{#if isLoadingDocument}
 			<div class="alert alert-info shadow-lg">
 				<span>Loading document…</span>
@@ -349,45 +525,67 @@
 		{/if}
 
 		{#if selectedDocument}
-			<section class="card border border-slate-200 bg-white shadow-xl">
-				<div class="card-body gap-6">
-					<div class="flex flex-col justify-between gap-6 lg:flex-row lg:items-start">
+				<section
+					class={`card rounded-lg border border-slate-200 bg-white shadow-xl border-l-4 ${sourceAccentClass(selectedDocument.document.source_system)}`}
+			>
+				<div class="card-body space-y-6">
 						<div class="space-y-3">
-							<h2 class="card-title text-3xl font-semibold">{selectedDocument.document.title}</h2>
-							<div class="flex flex-wrap items-center gap-3 text-xs text-slate-600">
-								<span class="badge badge-primary badge-outline uppercase">{selectedDocument.document.source_system}</span>
-								<span class="badge badge-outline">Segments: {selectedDocument.segments.length}</span>
-								{#if selectedDocument.keywords.length}
-									<span class="badge badge-outline">Keywords: {selectedDocument.keywords.length}</span>
+							<div class="flex flex-wrap items-start justify-between gap-3">
+								<h2 class="card-title text-3xl font-semibold">{selectedDocument.document.title}</h2>
+								<div
+									class="text-right text-sm text-slate-600"
+									title={documentDateTooltip(selectedDocument)}
+								>
+									<span class="font-semibold text-slate-900">Updated:</span>
+									{formatShortDate(selectedDocument.document.updated_at)}
+								</div>
+							</div>
+						<div class="flex flex-wrap items-center justify-between gap-3">
+							<div class="flex flex-wrap items-center gap-2 text-xs text-slate-600">
+								{#if selectedDocumentCharLabel}
+									<span class="badge badge-outline">{selectedDocumentCharLabel}</span>
+								{/if}
+								{#if selectedDocumentSegmentLabel}
+									<span class="badge badge-outline">{selectedDocumentSegmentLabel}</span>
 								{/if}
 							</div>
-						</div>
-						<div class="grid gap-2 text-sm text-slate-600">
-							<span><strong class="font-semibold text-slate-900">Created:</strong> {formatDate(selectedDocument.document.created_at)}</span>
-							<span><strong class="font-semibold text-slate-900">Updated:</strong> {formatDate(selectedDocument.document.updated_at)}</span>
-							<span><strong class="font-semibold text-slate-900">Ingested:</strong> {formatDate(selectedDocument.version.ingested_at)}</span>
+							<div class="flex flex-wrap items-center gap-3 text-xs text-slate-600">
+								<span class="font-semibold text-slate-500">
+									{emptySegmentCount} empty segment{emptySegmentCount === 1 ? '' : 's'}
+								</span>
+								<div class="join">
+									<button
+										type="button"
+										class={`btn btn-sm join-item ${showEmptySegments ? 'btn-primary' : 'btn-ghost'}`}
+										onclick={() => (showEmptySegments = true)}
+										disabled={emptySegmentCount === 0}
+									>
+										Show
+									</button>
+									<button
+										type="button"
+										class={`btn btn-sm join-item ${showEmptySegments ? 'btn-ghost' : 'btn-primary'}`}
+										onclick={() => (showEmptySegments = false)}
+										disabled={emptySegmentCount === 0}
+									>
+										Hide
+									</button>
+								</div>
+							</div>
 						</div>
 					</div>
 
-					<div class="flex flex-wrap items-center gap-3">
-						<button
-							class="btn btn-sm btn-outline"
-							onclick={() => (showEmptySegments = !showEmptySegments)}
-						>
-							{showEmptySegments ? 'Hide empty segments' : 'Show all segments'}
-						</button>
-						{#if hiddenSegmentCount > 0 && !showEmptySegments}
-							<span class="text-xs text-slate-500">
-								Hiding {hiddenSegmentCount} empty segment{hiddenSegmentCount === 1 ? '' : 's'}
-							</span>
-						{/if}
+			{#if selectedDocument.document.summary}
+				<section class="rounded-lg border border-slate-200 bg-slate-50 p-4">
+					<header class="mb-3 flex items-center justify-between gap-2">
+						<span class="text-sm font-semibold uppercase tracking-wide text-slate-500">Conversation overview</span>
+						<span class="text-xs text-slate-400">scrollable summary (Markdown)</span>
+					</header>
+					<div class="markdown max-h-60 overflow-y-auto text-slate-700">
+						{@html renderMarkdown(sanitizeSummary(selectedDocument.document.summary))}
 					</div>
-
-					{#if selectedDocument.document.summary}
-						<p class="rounded-2xl border border-slate-200 bg-slate-50 p-4 leading-relaxed text-slate-700">
-							{selectedDocument.document.summary}
-						</p>
-					{/if}
+				</section>
+			{/if}
 
 					{#if selectedDocument.keywords.length}
 						<div>
@@ -399,247 +597,253 @@
 							</div>
 						</div>
 					{/if}
+
+					<div class="rounded-lg border border-slate-100 bg-slate-50 p-4">
+						<div class="flex flex-wrap items-center justify-between gap-3">
+							<div class="text-sm font-semibold tracking-wide text-slate-600">View</div>
+							<div class="join">
+								<button
+									type="button"
+									class={`btn btn-sm join-item ${viewMode === 'sections' ? 'btn-primary' : 'btn-ghost'}`}
+									onclick={() => (viewMode = 'sections')}
+								>
+									By segment
+								</button>
+								<button
+									type="button"
+									class={`btn btn-sm join-item ${viewMode === 'document' ? 'btn-primary' : 'btn-ghost'}`}
+									onclick={() => (viewMode = 'document')}
+								>
+									Whole document
+								</button>
+							</div>
+						</div>
+					</div>
 				</div>
 			</section>
 
-			<section class="card border border-slate-200 bg-white shadow-xl">
-				<div class="card-body space-y-4">
-					<div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-						<div>
-							<h3 class="text-xl font-semibold">Full conversation transcript</h3>
-							<p class="text-sm text-slate-500">
-								View every segment together or download a Markdown copy for sharing.
-							</p>
-						</div>
-						<div class="flex flex-wrap gap-2">
-							<button
-								type="button"
-								class="btn btn-sm btn-primary"
-								onclick={() => loadTranscript(transcript?.document.id === selectedDocumentId)}
-								disabled={!selectedDocumentId || isTranscriptLoading}
-							>
-								{transcript && transcript.document.id === selectedDocumentId ? 'Refresh transcript' : 'Load transcript'}
-							</button>
-							{#if transcriptDownloadUrl}
-								<a
-									class="btn btn-sm btn-outline"
-									href={transcriptDownloadUrl}
-									target="_blank"
-									rel="noreferrer"
-								>
-									Download Markdown
-								</a>
+				{#if viewMode === 'document'}
+					<section class="card rounded-lg border border-slate-200 bg-white shadow-xl">
+						<div class="card-body">
+							<div class="flex items-center justify-between">
+								<h3 class="text-lg font-semibold text-slate-900">Whole document</h3>
+								{#if transcriptDownloadUrl}
+									<a class="btn btn-sm btn-outline" href={transcriptDownloadUrl} target="_blank" rel="noreferrer">
+										Export
+									</a>
+								{/if}
+							</div>
+							{#if isTranscriptLoading}
+								<div class="alert alert-info rounded-md bg-white text-slate-600">
+									<span>Rendering full document…</span>
+								</div>
+							{:else if transcriptError}
+								<div class="alert alert-error rounded-md bg-white text-slate-600">
+									<span>{transcriptError}</span>
+								</div>
+							{:else if transcript && transcript.document.id === selectedDocumentId}
+								<div class="markdown prose max-w-none">
+									{@html renderMarkdown(transcript.markdown)}
+								</div>
 							{:else}
-								<button class="btn btn-sm btn-outline" disabled>Download Markdown</button>
+								<p class="text-sm text-slate-500">Preparing full document…</p>
 							{/if}
 						</div>
-					</div>
-
-					{#if isTranscriptLoading}
-						<div class="alert alert-info bg-slate-50 text-slate-600">
-							<span>Loading transcript…</span>
-						</div>
-					{:else if transcriptError}
-						<div class="alert alert-error bg-slate-50 text-slate-600">
-							<span>{transcriptError}</span>
-						</div>
-					{:else if transcript && transcript.document.id === selectedDocumentId}
-						<div class="markdown prose max-w-none rounded-2xl border border-slate-200 bg-white p-4">
-							{@html renderMarkdown(transcript.markdown)}
-						</div>
-					{:else}
-						<p class="text-sm text-slate-500">Load the transcript to render the entire conversation in order.</p>
-					{/if}
-				</div>
-			</section>
-
-			{#if currentSegment}
-				<section class="space-y-4">
-					<div class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3">
-						<div class="flex flex-wrap gap-2">
-							<button type="button" class="btn btn-sm btn-outline" onclick={firstSegment} disabled={selectedSegmentIndex === 0}>
-								⤒ First
-							</button>
-							<button type="button" class="btn btn-sm btn-outline" onclick={previousSegment} disabled={selectedSegmentIndex === 0}>
-								← Previous
-							</button>
-						</div>
-						<span class="text-sm text-slate-600">
-							Segment {visibleSegments.length ? selectedSegmentIndex + 1 : 0} of {visibleSegments.length}
-						</span>
-						<div class="flex flex-wrap gap-2">
-							<button
-								type="button"
-								class="btn btn-sm btn-outline"
-								onclick={nextSegment}
-								disabled={selectedSegmentIndex >= visibleSegments.length - 1}
-							>
-								Next →
-							</button>
-							<button
-								type="button"
-								class="btn btn-sm btn-outline"
-								onclick={lastSegment}
-								disabled={selectedSegmentIndex >= visibleSegments.length - 1}
-							>
-								Last ⤓
-							</button>
-						</div>
-					</div>
-
-					<div
-						role="group"
-						class="card border border-slate-200 bg-white shadow-lg"
-						oncontextmenu={(event) => {
-							event.preventDefault();
-							if (currentSegment) downloadSegment(currentSegment.id);
-						}}
-					>
-						<div class={`card-body space-y-6 ${currentSegment ? segmentAccentClass(currentSegment.source_role) : ''}`}>
-							<header class="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-600">
-								<span
-									class={`badge badge-lg border-none px-4 py-1 text-sm font-semibold uppercase tracking-wide ${
-										currentSegment.source_role === 'assistant'
-											? 'badge-secondary'
-											: currentSegment.source_role === 'user'
-												? 'badge-info'
-												: 'badge-outline'
-									}`}
-								>
-									{roleLabel(currentSegment.source_role)}
-								</span>
-								<div class="flex flex-wrap items-center gap-2">
-									<span>{formatDate(currentSegment.started_at)} · {currentSegment.segment_type}</span>
-									<button class="btn btn-xs btn-outline" onclick={() => downloadSegment(currentSegment.id)}>Export</button>
+					</section>
+				{:else if viewMode === 'sections'}
+					{#if currentSegment}
+						<section class="space-y-4">
+							<div class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3">
+								<div class="flex flex-wrap gap-2">
+									<button type="button" class="btn btn-sm btn-outline" onclick={firstSegment} disabled={selectedSegmentIndex === 0}>
+										⤒ First
+									</button>
+									<button type="button" class="btn btn-sm btn-outline" onclick={previousSegment} disabled={selectedSegmentIndex === 0}>
+										← Previous
+									</button>
 								</div>
-							</header>
-
-							<div class="markdown">
-								{@html renderMarkdown(currentSegment.content_markdown)}
+								<span class="text-sm text-slate-600">
+									Segment {visibleSegments.length ? selectedSegmentIndex + 1 : 0} of {visibleSegments.length}
+								</span>
+								<div class="flex flex-wrap gap-2">
+									<button
+										type="button"
+										class="btn btn-sm btn-outline"
+										onclick={nextSegment}
+										disabled={selectedSegmentIndex >= visibleSegments.length - 1}
+									>
+										Next →
+									</button>
+									<button
+										type="button"
+										class="btn btn-sm btn-outline"
+										onclick={lastSegment}
+										disabled={selectedSegmentIndex >= visibleSegments.length - 1}
+									>
+										Last ⤓
+									</button>
+								</div>
 							</div>
 
-							{#if hasDetailedBlocks}
-								<div class="space-y-4">
-									{#each currentSegment.blocks as block}
-										{#if block.block_type !== 'markdown'}
-										<div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-											<div class="flex flex-wrap items-center gap-2 text-xs">
-												<span class="badge badge-outline">{blockLabelType(block.block_type)}</span>
-												{#if block.language}
-													<span class="badge badge-outline badge-success">{block.language}</span>
-												{/if}
-											</div>
-											{#if block.block_type === 'code'}
-												<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-													<span>{normalizeFenceLanguage(block.language ?? null)} block</span>
-													<div class="flex flex-wrap gap-2">
-														<button class="btn btn-xs btn-outline" onclick={() => copyCodeToClipboard(block.body)}>
-															Copy
-														</button>
-														<button
-															class="btn btn-xs btn-outline"
-															onclick={() => downloadCode(block.body, `segment-${currentSegment.sequence}-code-block-${block.sequence}.txt`)}
-														>
-															Download
-														</button>
-													</div>
-												</div>
-												<pre class="overflow-x-auto rounded-xl border border-slate-200 bg-slate-100 p-4 text-sm leading-relaxed text-slate-900"><code>{block.body}</code></pre>
-											{:else}
-												<div class="markdown">
-													{@html renderMarkdown(block.body)}
-												</div>
-											{/if}
+							<div role="group" class="card rounded-lg border border-slate-200 bg-white shadow-lg">
+								<div class={`card-body space-y-6 ${currentSegment ? segmentAccentClass(currentSegment.source_role) : ''}`}>
+									<header class="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-600">
+										<span
+											class={`badge badge-lg border-none px-4 py-1 text-sm font-semibold uppercase tracking-wide ${
+												currentSegment.source_role === 'assistant'
+													? 'badge-secondary'
+													: currentSegment.source_role === 'user'
+														? 'badge-info'
+														: 'badge-outline'
+											}`}
+										>
+											{roleLabel(currentSegment.source_role)}
+										</span>
+										<div class="flex flex-wrap items-center gap-2">
+											<span>{formatDate(currentSegment.started_at)} · {currentSegment.segment_type}</span>
+											<button
+												class="btn btn-xs btn-outline"
+												onclick={() => downloadSegment(currentSegment.id)}
+												oncontextmenu={(event) => {
+													event.preventDefault();
+													downloadSegment(currentSegment.id);
+												}}
+											>
+												Export
+											</button>
 										</div>
-										{/if}
-									{/each}
-								</div>
-							{/if}
+									</header>
 
-							{#if codeFences.length}
-								<div class="space-y-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-									<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Code snippets</h4>
-									{#each codeFences as fence, index}
-										<div class="space-y-2 rounded-2xl border border-slate-200 bg-white p-4">
-											<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-												<span>{normalizeFenceLanguage(fence.language)} snippet {index + 1}</span>
-												<div class="flex flex-wrap gap-2">
-													<button class="btn btn-xs btn-outline" onclick={() => copyCodeToClipboard(fence.content)}>
-														Copy
-													</button>
-													<button
-														class="btn btn-xs btn-outline"
-														onclick={() => downloadCode(fence.content, `segment-${currentSegment.sequence}-code-${index + 1}.txt`)}
-													>
-														Download
-													</button>
-												</div>
-											</div>
-											<pre class="overflow-x-auto rounded-xl border border-slate-200 bg-slate-100 p-4 text-sm leading-relaxed text-slate-900">
-												<code>{fence.content}</code>
-											</pre>
-										</div>
-									{/each}
-								</div>
-							{/if}
-
-							{#if currentSegment.assets.length}
-								<div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-									<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Attachments</h4>
-									<ul class="space-y-3">
-										{#each currentSegment.assets as asset}
-											<li class="space-y-3 rounded-xl border border-slate-200 bg-white p-3 text-sm">
-												<div class="flex flex-wrap items-center justify-between gap-3">
-													<div class="flex flex-wrap items-center gap-2">
-														<span class="badge badge-outline badge-info">{asset.asset_type}</span>
-														<span class="font-semibold text-slate-900">{asset.file_name ?? 'Unnamed asset'}</span>
-														{#if asset.mime_type}
-															<span class="text-xs text-slate-500">({asset.mime_type})</span>
-														{/if}
-														{#if formatBytes(asset.size_bytes)}
-															<span class="text-xs text-slate-500">· {formatBytes(asset.size_bytes)}</span>
-														{/if}
+									{#if segmentedContent.length}
+										<div class="space-y-6">
+											{#each segmentedContent as part, index}
+												{#if part.kind === 'markdown'}
+													<div class="markdown">
+														{@html renderMarkdown(part.content)}
 													</div>
-													<div class="flex flex-wrap gap-2">
-														{#if asset.has_content}
-															<a
-																class="btn btn-xs btn-outline"
-																href={attachmentUrl(asset, true) ?? '#'}
-																target="_blank"
-																rel="noreferrer"
-															>
-																Download
-															</a>
-														{/if}
-													</div>
-												</div>
-												{#if asset.has_content}
-													{#if isImageAsset(asset)}
-														<img
-															src={attachmentUrl(asset) ?? ''}
-															alt={asset.file_name ?? 'Attachment preview'}
-															class="w-full max-h-[360px] rounded-lg border border-slate-200 bg-white object-contain"
-															loading="lazy"
-														/>
-													{:else}
-														<p class="text-xs text-slate-500">Preview not available. Use the download button to view this attachment.</p>
-													{/if}
 												{:else}
-													<p class="text-xs text-slate-500">Content not available for this attachment.</p>
+													<div class="space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-4">
+														<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+															<span>{normalizeFenceLanguage(part.language)} snippet {part.snippet}</span>
+															<div class="flex flex-wrap gap-2">
+																<button class="btn btn-xs btn-outline" onclick={() => copyCodeToClipboard(part.content)}>
+																	Copy
+																</button>
+																<button
+																	class="btn btn-xs btn-outline"
+																	onclick={() => downloadCode(part.content, `segment-${currentSegment.sequence}-code-${part.snippet}.txt`)}
+																>
+																	Download
+																</button>
+															</div>
+														</div>
+														<pre class="code-block overflow-x-auto rounded-md border border-slate-200 bg-white p-4 text-sm leading-relaxed text-slate-900"><code>{@html highlightCode(part.content, part.language).trim()}</code></pre>
+													</div>
 												{/if}
-											</li>
-										{/each}
-									</ul>
+											{/each}
+										</div>
+									{:else}
+										<div class="markdown">
+											{@html renderMarkdown(currentSegment.content_markdown)}
+										</div>
+									{/if}
+
+									{#if hasDetailedBlocks}
+										<div class="space-y-4">
+											{#each currentSegment.blocks as block}
+												{#if block.block_type !== 'markdown'}
+												<div class="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4">
+													<div class="flex flex-wrap items-center gap-2 text-xs">
+														<span class="badge badge-outline">{blockLabelType(block.block_type)}</span>
+														{#if block.language}
+															<span class="badge badge-outline badge-success">{block.language}</span>
+														{/if}
+													</div>
+													{#if block.block_type === 'code'}
+														<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+															<span>{normalizeFenceLanguage(block.language ?? null)} block</span>
+															<div class="flex flex-wrap gap-2">
+																<button class="btn btn-xs btn-outline" onclick={() => copyCodeToClipboard(block.body)}>
+																	Copy
+																</button>
+																<button
+																	class="btn btn-xs btn-outline"
+																	onclick={() => downloadCode(block.body, `segment-${currentSegment.sequence}-code-block-${block.sequence}.txt`)}
+																>
+																	Download
+																</button>
+															</div>
+														</div>
+														<pre class="code-block overflow-x-auto rounded-md border border-slate-200 bg-slate-100 p-4 text-sm leading-relaxed text-slate-900"><code>{@html highlightCode(block.body, block.language ?? null).trim()}</code></pre>
+													{:else}
+														<div class="markdown">
+															{@html renderMarkdown(block.body)}
+														</div>
+													{/if}
+												</div>
+												{/if}
+											{/each}
+										</div>
+									{/if}
+
+									{#if currentSegment.assets.length}
+										<div class="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4">
+											<h4 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Attachments</h4>
+											<ul class="space-y-3">
+												{#each currentSegment.assets as asset}
+													<li class="space-y-3 rounded-md border border-slate-200 bg-white p-3 text-sm">
+														<div class="flex flex-wrap items-center justify-between gap-3">
+															<div class="flex flex-wrap items-center gap-2">
+																<span class="badge badge-outline badge-info">{asset.asset_type}</span>
+																<span class="font-semibold text-slate-900">{asset.file_name ?? 'Unnamed asset'}</span>
+																{#if asset.mime_type}
+																	<span class="text-xs text-slate-500">({asset.mime_type})</span>
+																{/if}
+																{#if formatBytes(asset.size_bytes)}
+																	<span class="text-xs text-slate-500">· {formatBytes(asset.size_bytes)}</span>
+																{/if}
+															</div>
+															<div class="flex flex-wrap gap-2">
+																{#if asset.has_content}
+																	<a
+																		class="btn btn-xs btn-outline"
+																		href={attachmentUrl(asset, true) ?? '#'}
+																		target="_blank"
+																		rel="noreferrer"
+																	>
+																		Download
+																	</a>
+																{/if}
+															</div>
+														</div>
+														{#if asset.has_content}
+															{#if isImageAsset(asset)}
+																<img
+																	src={attachmentUrl(asset) ?? ''}
+																	alt={asset.file_name ?? 'Attachment preview'}
+																	class="w-full max-h-[360px] rounded-sm border border-slate-200 bg-white object-contain"
+																	loading="lazy"
+																/>
+															{:else}
+																<p class="text-xs text-slate-500">Preview not available. Use the download button to view this attachment.</p>
+															{/if}
+														{:else}
+															<p class="text-xs text-slate-500">Content not available for this attachment.</p>
+														{/if}
+													</li>
+												{/each}
+											</ul>
+										</div>
+									{/if}
 								</div>
-							{/if}
+							</div>
+						</section>
+					{:else}
+						<div class="alert alert-info bg-slate-50 text-slate-600">
+							<span>No segments to display. Try showing empty segments or pick another document.</span>
 						</div>
-					</div>
-				</section>
-			{:else}
-				<div class="alert alert-info bg-slate-50 text-slate-600">
-					<span>No segments to display. Try showing empty segments or pick another document.</span>
-				</div>
-			{/if}
+					{/if}
+				{/if}
 		{:else}
 			<div class="alert alert-info bg-slate-50 text-slate-600">
 				<span>Select a document to begin.</span>

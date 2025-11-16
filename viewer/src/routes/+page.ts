@@ -33,13 +33,18 @@ export const load = (async ({ fetch, url }) => {
 		const docId = initialDocument.document.id;
 		const exists = documents.some((doc) => doc.id === docId);
 		if (!exists) {
+			const fallbackCharCount = initialDocument.segments.reduce(
+				(total, segment) => total + (segment.content_markdown?.length ?? 0),
+				0
+			);
 			documents.unshift({
 				id: docId,
 				title: initialDocument.document.title,
 				source_system: initialDocument.document.source_system,
 				created_at: initialDocument.document.created_at,
 				updated_at: initialDocument.document.updated_at,
-				segment_count: initialDocument.segments.length
+				segment_count: initialDocument.segments.length,
+				char_count: fallbackCharCount
 			});
 		}
 	}

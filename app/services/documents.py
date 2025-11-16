@@ -128,11 +128,18 @@ SELECT
     d.source_system,
     d.created_at,
     d.updated_at,
-    COUNT(ds.id) AS segment_count
+    COUNT(ds.id) AS segment_count,
+    COALESCE(SUM(char_length(COALESCE(ds.content_markdown, ''))), 0) AS char_count
 FROM documents d
-JOIN document_versions dv ON dv.document_id = d.id
-LEFT JOIN document_segments ds ON ds.document_version_id = dv.id
-GROUP BY d.id
+JOIN LATERAL (
+    SELECT dv.id
+    FROM document_versions dv
+    WHERE dv.document_id = d.id
+    ORDER BY dv.ingested_at DESC
+    LIMIT 1
+) latest_version ON TRUE
+LEFT JOIN document_segments ds ON ds.document_version_id = latest_version.id
+GROUP BY d.id, d.title, d.source_system, d.created_at, d.updated_at
 ORDER BY d.updated_at DESC
 LIMIT %(limit)s OFFSET %(offset)s;
 """
@@ -218,6 +225,7 @@ def list_documents(conn, limit: int = 20, offset: int = 0) -> List[DocumentSumma
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             segment_count=row["segment_count"],
+            char_count=row["char_count"],
         )
         for row in rows
     ]

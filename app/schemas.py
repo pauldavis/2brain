@@ -106,6 +106,7 @@ class DocumentSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     segment_count: int
+    char_count: int
 
 
 class SearchResult(BaseModel):
