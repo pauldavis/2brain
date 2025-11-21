@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import string
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -9,6 +10,12 @@ import psycopg
 from psycopg.types.json import Json
 
 from ingest.models import SegmentInput
+
+
+@dataclass
+class PersistResult:
+    document_created: bool
+    version_created: bool
 
 QUALITY_NOISE_THRESHOLD = 0.2
 
@@ -85,8 +92,8 @@ def persist_document(
     checksum: bytes,
     raw_payload: Mapping[str, object],
     segments: Sequence[SegmentInput],
-) -> bool:
-    """Insert or update a document and its segments. Returns True if a new version was created."""
+) -> PersistResult:
+    """Insert or update a document and its segments."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -107,7 +114,7 @@ def persist_document(
                 created_at = EXCLUDED.created_at,
                 updated_at = EXCLUDED.updated_at,
                 raw_metadata = EXCLUDED.raw_metadata
-            RETURNING id
+            RETURNING id, xmax = 0 AS inserted
             """,
             (
                 source_system,
@@ -123,6 +130,7 @@ def persist_document(
         if document_row is None:
             raise RuntimeError("Failed to insert or update document record.")
         document_id = document_row[0]
+        document_created = bool(document_row[1])
 
         cur.execute(
             """
@@ -146,7 +154,10 @@ def persist_document(
         )
         version_row = cur.fetchone()
         if not version_row:
-            return False
+            return PersistResult(
+                document_created=document_created,
+                version_created=False,
+            )
         document_version_id = version_row[0]
 
         node_to_segment_id: dict[str, str] = {}
@@ -288,4 +299,7 @@ def persist_document(
                         attachment_id,
                     ),
                 )
-    return True
+    return PersistResult(
+        document_created=document_created,
+        version_created=True,
+    )

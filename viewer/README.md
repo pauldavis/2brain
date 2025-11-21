@@ -6,7 +6,7 @@ document browser with segment-level navigation.
 ### Prerequisites
 
 - Node.js 22.12.0+ (or 20.19.0+ if you stay on the 20.x LTS line) — required by Vite 7 and the Svelte 5 toolchain
-- The FastAPI service running locally (default `http://localhost:8000`)
+- The FastAPI service running locally (default `http://localhost:8100`)
 
 ### Install & run
 

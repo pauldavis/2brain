@@ -23,6 +23,19 @@ class Settings:
             )
         self.database_url = database_url
 
+        api_host = os.environ.get("API_HOST", "127.0.0.1").strip()
+        self.api_host = api_host or "127.0.0.1"
+
+        port_raw = os.environ.get("API_PORT", "8100").strip()
+        if not port_raw:
+            port_raw = "8100"
+        try:
+            self.api_port = int(port_raw)
+        except ValueError as exc:  # pragma: no cover - defensive config guard
+            raise RuntimeError("API_PORT must be an integer") from exc
+        if self.api_port <= 0:
+            raise RuntimeError("API_PORT must be a positive integer")
+
         probes = os.environ.get("IVFFLAT_PROBES", "").strip()
         if probes:
             try:

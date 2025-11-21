@@ -55,3 +55,15 @@ SQL
 ```
 
 You should see counts greater than zero for all core tables after a successful run.
+
+## 6. Run the AI Studio ingestion script
+
+Google AI Studio exports mix plain files (PDF, CSV, PNG, etc.) and serialized conversations. Point the ingester at the directory that contains everything (the repository currently keeps them under `docs/samples/Google AI Studio`):
+
+```bash
+python -m ingest.aistudio "docs/samples/Google AI Studio"
+```
+
+The script recursively scans the directory, looking for JSON blobs that include both `runSettings` and `chunkedPrompt` objects. Those are treated as conversations and ingested into `documents`/`document_segments`. File uploads referenced in the conversations (`driveDocument`, `driveImage`, etc.) are preserved as `segment_assets` with their Drive IDs, even when we do not have a local file match yet.
+
+> ℹ️ Many attachments in the current export do not expose a Drive ID → file mapping. The ingester still records the Drive IDs so that we can backfill the links later.

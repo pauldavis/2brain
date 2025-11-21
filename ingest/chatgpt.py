@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
 
 
-from ingest.db import persist_document
+from ingest.db import PersistResult, persist_document
 from ingest.models import SegmentAssetInput, SegmentBlockInput, SegmentInput
 
 
@@ -172,7 +172,7 @@ def ingest_conversation(
     conn: psycopg.Connection,
     conversation: dict,
     export_dir: Path,
-) -> None:
+) -> PersistResult:
     resolver = ChatGPTAssetResolver(export_dir)
     segments = collect_segments(conversation, resolver)
 
@@ -198,7 +198,7 @@ def ingest_conversation(
     checksum_input = json.dumps(conversation, sort_keys=True).encode("utf-8")
     checksum = hashlib.sha256(checksum_input).digest()
 
-    persist_document(
+    return persist_document(
         conn,
         source_system="chatgpt",
         external_id=conversation["conversation_id"],
@@ -212,6 +212,14 @@ def ingest_conversation(
         raw_payload=conversation,
         segments=segments,
     )
+
+
+def _print_progress(stats: Dict[str, int], current: str) -> None:
+    message = (
+        f"new: {stats['new']} | updated: {stats['updated']} | "
+        f"unchanged: {stats['unchanged']} | {current}"
+    )
+    print(f"\r{message}\x1b[K", end="", flush=True)
 
 
 def run_cli() -> None:
@@ -259,17 +267,33 @@ def run_cli() -> None:
     if args.limit is not None:
         conversations = conversations[: args.limit]
 
+    stats = {"new": 0, "updated": 0, "unchanged": 0}
     with psycopg.connect(dsn) as conn:
         ingested = 0
         for conversation in conversations:
             try:
-                ingest_conversation(conn, conversation, export_dir)
+                result = ingest_conversation(conn, conversation, export_dir)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
+
+            if not result.version_created:
+                stats["unchanged"] += 1
+            elif result.document_created:
+                stats["new"] += 1
+            else:
+                stats["updated"] += 1
+
             ingested += 1
-        print(f"Ingested {ingested} conversation(s) from {export_dir}")
+            name = conversation.get("title") or conversation.get("id") or "conversation"
+            _print_progress(stats, name)
+
+    print("\r" + " " * 120 + "\r", end="")
+    print(
+        f"Ingested {ingested} conversation(s) from {export_dir} | "
+        f"new: {stats['new']} updated: {stats['updated']} unchanged: {stats['unchanged']}"
+    )
 
 
 if __name__ == "__main__":
