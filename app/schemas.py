@@ -121,3 +121,26 @@ class SearchResult(BaseModel):
     source_role: str
     snippet: str
     started_at: Optional[datetime] = None
+
+
+class SearchSegmentMatch(BaseModel):
+    segment_id: UUID
+    sequence: int
+    source_role: str
+    score: float
+    snippet: str
+
+
+class DocumentSearchResult(BaseModel):
+    document_id: UUID
+    document_title: str
+    source_system: str
+    document_updated_at: Optional[datetime] = None
+    document_segment_count: Optional[int] = None
+    document_char_count: Optional[int] = None
+    match_count: int
+    match_density: float
+    document_score: float
+    best_segment_score: float
+    topk_score: float
+    top_segments: List[SearchSegmentMatch] = Field(default_factory=list)

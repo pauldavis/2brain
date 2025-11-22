@@ -6,14 +6,15 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 
 from app.db import get_connection
-from app.schemas import SearchResult
+from app.schemas import DocumentSearchResult, SearchResult
 from app.metrics import log_query_stat
 import time
 from app.services.search import (
+    embed_query_openai,
+    search_documents_hybrid_rrf,
     search_segments,
     search_segments_bm25,
     search_segments_hybrid_rrf,
-    embed_query_openai,
 )
 
 
@@ -106,6 +107,58 @@ def search_hybrid_endpoint(
             "w_bm25": w_bm25,
             "w_vec": w_vec,
             "k": k,
+            "elapsed_ms": round(elapsed_ms, 2),
+        }
+    )
+    return results
+
+
+@router.get("/search/hybrid_documents", response_model=List[DocumentSearchResult])
+def search_hybrid_documents_endpoint(
+    q: str = Query(..., description="Free-form query aggregated to documents."),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    w_bm25: float = Query(0.5, ge=0.0, le=1.0),
+    w_vec: float = Query(0.5, ge=0.0, le=1.0),
+    k: int = Query(60, ge=1),
+    doc_topk: int = Query(3, ge=1, le=10, description="How many top segments contribute to doc score."),
+    doc_top_segments: int = Query(3, ge=1, le=10, description="How many segment previews to return."),
+    segment_limit: Optional[int] = Query(
+        None,
+        ge=10,
+        description="Optional override for number of ranked segments considered before aggregation.",
+    ),
+    conn=Depends(get_connection),
+) -> List[DocumentSearchResult]:
+    qvec = embed_query_openai(q)
+    t0 = time.perf_counter()
+    results, meta = search_documents_hybrid_rrf(
+        conn,
+        q=q,
+        q_embedding=qvec,
+        limit=limit,
+        offset=offset,
+        w_bm25=w_bm25,
+        w_vec=w_vec,
+        k=k,
+        doc_topk=doc_topk,
+        doc_top_segments=doc_top_segments,
+        segment_limit=segment_limit,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    log_query_stat(
+        {
+            "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "mode": "hybrid_documents",
+            "q": q,
+            "count": meta.get("count"),
+            "best_score": meta.get("best_score"),
+            "w_bm25": w_bm25,
+            "w_vec": w_vec,
+            "k": k,
+            "doc_topk": doc_topk,
+            "doc_top_segments": doc_top_segments,
+            "segment_limit": segment_limit,
             "elapsed_ms": round(elapsed_ms, 2),
         }
     )

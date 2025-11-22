@@ -1,8 +1,7 @@
 import type { PageLoad } from './$types';
 import type { DocumentSummary, DocumentView } from '$lib/types';
-import { env } from '$env/dynamic/public';
-
-const API_BASE = env.PUBLIC_API_BASE || 'http://localhost:8100';
+const RAW_API_BASE = import.meta.env.PUBLIC_API_BASE ?? 'http://localhost:8100';
+const API_BASE = RAW_API_BASE.endsWith('/') ? RAW_API_BASE.slice(0, -1) : RAW_API_BASE;
 const DEFAULT_LIMIT = 50;
 
 export const load = (async ({ fetch, url }) => {

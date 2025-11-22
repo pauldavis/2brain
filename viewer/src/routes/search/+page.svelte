@@ -1,13 +1,14 @@
 <script lang="ts">
   import type { PageData } from './$types';
-  import type { SearchResult } from '$lib/types';
+  import type { DocumentSearchResult, SearchResult } from '$lib/types';
 
   const props = $props<{ data: PageData }>();
   const data = $state(props.data);
   const API_BASE = $derived(data.apiBase);
   let q = $state('');
   let mode: 'bm25' | 'hybrid' = $state('bm25');
-  let results = $state<SearchResult[]>([]);
+  let segmentResults = $state<SearchResult[]>([]);
+  let documentResults = $state<DocumentSearchResult[]>([]);
   let loading = $state(false);
   let errorMsg = $state('');
   let threshold: string = $state('');
@@ -20,6 +21,8 @@
   let analyzePlan = $state(false);
 
   const dateFormatter = new Intl.DateTimeFormat('en-US', { month: 'short', day: '2-digit', year: 'numeric' });
+  const numberFormatter = new Intl.NumberFormat();
+  const percentFormatter = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 });
 
   function formatDate(value?: string | null) {
     if (!value) return '—';
@@ -28,7 +31,17 @@
 
   function formatChars(value?: number | null) {
     if (!value) return '0';
-    return new Intl.NumberFormat().format(value);
+    return numberFormatter.format(value);
+  }
+
+  function formatNumber(value?: number | null) {
+    if (value === undefined || value === null) return '0';
+    return numberFormatter.format(value);
+  }
+
+  function formatPercent(value?: number | null) {
+    if (typeof value !== 'number' || Number.isNaN(value)) return '0%';
+    return percentFormatter.format(Math.max(0, value));
   }
 
   function applyCommonSearchParams(u: URL) {
@@ -37,7 +50,7 @@
   }
 
   async function run() {
-    loading = true; errorMsg = ''; results = [];
+    loading = true; errorMsg = ''; segmentResults = []; documentResults = [];
     try {
       let url: string;
       if (mode === 'bm25') {
@@ -47,7 +60,7 @@
         if (threshold.trim()) u.searchParams.set('threshold', threshold);
         url = u.toString();
       } else {
-        const u = new URL('search/hybrid', API_BASE);
+        const u = new URL('search/hybrid_documents', API_BASE);
         u.searchParams.set('q', q);
         u.searchParams.set('w_bm25', String(w_bm25));
         u.searchParams.set('w_vec', String(w_vec));
@@ -57,7 +70,11 @@
       }
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      results = await res.json();
+      if (mode === 'bm25') {
+        segmentResults = await res.json();
+      } else {
+        documentResults = await res.json();
+      }
     } catch (e) {
       errorMsg = e instanceof Error ? e.message : 'Unknown error';
     } finally {
@@ -188,9 +205,9 @@
     {/if}
   </section>
 
-  {#if results.length}
+  {#if mode === 'bm25' && segmentResults.length}
     <ul class="space-y-3">
-      {#each results as r (r.segment_id)}
+      {#each segmentResults as r (r.segment_id)}
         <li
           class="group rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-sky-300"
           oncontextmenu={(event) => { event.preventDefault(); downloadSegment(r.segment_id, r.document_title); }}
@@ -216,6 +233,56 @@
           <div class="mt-3 flex flex-wrap gap-2 text-xs text-slate-500">
             {#if r.started_at}<span>Started {formatDate(r.started_at)}</span>{/if}
             <button class="btn btn-xs btn-outline" onclick={() => downloadSegment(r.segment_id, r.document_title)}>Export segment</button>
+          </div>
+        </li>
+      {/each}
+    </ul>
+  {:else if mode === 'hybrid' && documentResults.length}
+    <ul class="space-y-4">
+      {#each documentResults as doc (doc.document_id)}
+        <li class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-sky-300">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div class="text-sm text-slate-600 space-y-1">
+              <a class="font-semibold text-slate-900 hover:text-sky-600" href={`/?document=${doc.document_id}`}>
+                {doc.document_title}
+              </a>
+              <div class="space-x-2 text-xs text-slate-500">
+                <span class="uppercase badge badge-outline">{doc.source_system}</span>
+                <span>Score {doc.document_score.toFixed(3)}</span>
+                <span>Matches {formatNumber(doc.match_count)}</span>
+                <span>Density {formatPercent(doc.match_density)}</span>
+              </div>
+            </div>
+            <div class="text-xs text-slate-500 text-right space-y-0.5">
+              <div>Updated {formatDate(doc.document_updated_at)}</div>
+              <div>{doc.document_segment_count ?? 0} segments · {formatChars(doc.document_char_count)} chars</div>
+            </div>
+          </div>
+          <div class="mt-3 space-y-3">
+            {#if doc.top_segments.length === 0}
+              <div class="text-sm text-slate-500">No preview segments captured.</div>
+            {:else}
+              {#each doc.top_segments as segment (segment.segment_id)}
+                <div class="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-1">
+                  <div class="flex flex-wrap items-center justify-between text-xs uppercase tracking-wide text-slate-500 gap-2">
+                    <span>Segment {segment.sequence} · {segment.source_role}</span>
+                    <span>Score {segment.score.toFixed(3)}</span>
+                  </div>
+                  <div class="markdown text-sm whitespace-pre-line wrap-break-word">
+                    {renderSnippet(segment.snippet)}
+                  </div>
+                  <div class="flex flex-wrap gap-2 text-xs text-slate-500">
+                    <button class="btn btn-xs btn-outline" onclick={() => downloadSegment(segment.segment_id, doc.document_title)}>Export segment</button>
+                    <a class="link link-hover" href={`/?document=${doc.document_id}&segment=${segment.segment_id}`}>Open in viewer</a>
+                  </div>
+                </div>
+              {/each}
+            {/if}
+            {#if doc.match_count > doc.top_segments.length}
+              <div class="text-xs text-slate-500">
+                +{formatNumber(doc.match_count - doc.top_segments.length)} more matching segment{doc.match_count - doc.top_segments.length === 1 ? '' : 's'} not shown.
+              </div>
+            {/if}
           </div>
         </li>
       {/each}
