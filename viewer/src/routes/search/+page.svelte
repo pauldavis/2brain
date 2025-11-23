@@ -262,7 +262,8 @@
             {#if doc.top_segments.length === 0}
               <div class="text-sm text-slate-500">No preview segments captured.</div>
             {:else}
-              {#each doc.top_segments as segment (segment.segment_id)}
+              {#each doc.top_segments as segment, index (segment.segment_id + '-' + index)}
+                {#if doc.top_segments.findIndex((s) => s.segment_id === segment.segment_id) === index}
                 <div class="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-1">
                   <div class="flex flex-wrap items-center justify-between text-xs uppercase tracking-wide text-slate-500 gap-2">
                     <span>Segment {segment.sequence} · {segment.source_role}</span>
@@ -276,6 +277,7 @@
                     <a class="link link-hover" href={`/?document=${doc.document_id}&segment=${segment.segment_id}`}>Open in viewer</a>
                   </div>
                 </div>
+                {/if}
               {/each}
             {/if}
             {#if doc.match_count > doc.top_segments.length}

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import mimetypes
 import os
@@ -16,8 +15,9 @@ try:
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
-from ingest.db import PersistResult, persist_document
+from ingest.db import PersistResult
 from ingest.models import SegmentAssetInput, SegmentBlockInput, SegmentInput
+from ingest.pipeline import ParsedDocument, ingest_document
 
 
 def load_conversations(export_dir: Path) -> List[dict]:
@@ -203,8 +203,8 @@ def build_segment(message: dict, sequence: int) -> SegmentInput:
 
 def collect_segments(conversation: dict) -> List[SegmentInput]:
     segments: List[SegmentInput] = []
-    for index, message in enumerate(conversation.get("chat_messages") or [], start=1):
-        segments.append(build_segment(message, sequence=index))
+    for message in conversation.get("chat_messages") or []:
+        segments.append(build_segment(message, sequence=0))
     return segments
 
 
@@ -215,11 +215,7 @@ def ingest_conversation(conn: psycopg.Connection, conversation: dict, export_dir
 
     raw_metadata = {"account": conversation.get("account")}
     source_path = str(export_dir / "conversations.json") + f"#{conversation['uuid']}"
-    checksum_input = json.dumps(conversation, sort_keys=True).encode("utf-8")
-    checksum = hashlib.sha256(checksum_input).digest()
-
-    return persist_document(
-        conn,
+    parsed_doc = ParsedDocument(
         source_system="claude",
         external_id=conversation["uuid"],
         title=conversation.get("name") or "Untitled conversation",
@@ -228,9 +224,17 @@ def ingest_conversation(conn: psycopg.Connection, conversation: dict, export_dir
         updated_at=updated_at,
         raw_metadata=raw_metadata,
         source_path=source_path,
-        checksum=checksum,
         raw_payload=conversation,
-        segments=segments,
+    )
+
+    return ingest_document(
+        conn,
+        parsed_doc,
+        segments,
+        ingest_batch_id=os.getenv("INGEST_BATCH_ID"),
+        ingested_by=os.getenv("INGESTED_BY") or os.getenv("USER"),
+        ingest_source="claude",
+        ingest_version=os.getenv("INGEST_VERSION"),
     )
 
 
@@ -291,6 +295,8 @@ def run_cli() -> None:
     with psycopg.connect(dsn) as conn:
         ingested = 0
         for conversation in conversations:
+            if not conversation.get("chat_messages"):
+                continue
             try:
                 result = ingest_conversation(conn, conversation, export_dir)
                 conn.commit()

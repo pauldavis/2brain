@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import mimetypes
 import os
@@ -17,7 +16,8 @@ except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
 
 
-from ingest.db import PersistResult, persist_document
+from ingest.db import PersistResult
+from ingest.pipeline import ParsedDocument, ingest_document
 from ingest.models import SegmentAssetInput, SegmentBlockInput, SegmentInput
 
 
@@ -60,7 +60,6 @@ def to_datetime(epoch: Optional[float]) -> Optional[datetime]:
 def collect_segments(conversation: dict, resolver: ChatGPTAssetResolver) -> List[SegmentInput]:
     mapping: Dict[str, dict] = conversation["mapping"]
     roots = [node_id for node_id, node in mapping.items() if node.get("parent") is None]
-    sequence_state: Dict[Optional[str], int] = {}
     segments: List[SegmentInput] = []
 
     def nearest_parent_with_message(node_id: Optional[str]) -> Optional[str]:
@@ -72,20 +71,15 @@ def collect_segments(conversation: dict, resolver: ChatGPTAssetResolver) -> List
             current = node.get("parent")
         return None
 
-    def next_sequence(parent_node_id: Optional[str]) -> int:
-        sequence_state[parent_node_id] = sequence_state.get(parent_node_id, 0) + 1
-        return sequence_state[parent_node_id]
-
     def visit(node_id: str) -> None:
         node = mapping[node_id]
         message = node.get("message")
         segment_parent_node_id = nearest_parent_with_message(node.get("parent"))
         if message:
-            sequence = next_sequence(segment_parent_node_id)
             segment = build_segment(
                 node_id=node_id,
                 parent_node_id=segment_parent_node_id,
-                sequence=sequence,
+                sequence=0,
                 message=message,
                 resolver=resolver,
             )
@@ -195,11 +189,8 @@ def ingest_conversation(
     raw_metadata = {key: conversation.get(key) for key in metadata_keys if conversation.get(key) is not None}
 
     source_path = str(export_dir / "conversations.json") + f"#{conversation['id']}"
-    checksum_input = json.dumps(conversation, sort_keys=True).encode("utf-8")
-    checksum = hashlib.sha256(checksum_input).digest()
 
-    return persist_document(
-        conn,
+    parsed_doc = ParsedDocument(
         source_system="chatgpt",
         external_id=conversation["conversation_id"],
         title=conversation.get("title") or "Untitled conversation",
@@ -208,9 +199,17 @@ def ingest_conversation(
         updated_at=updated_at,
         raw_metadata=raw_metadata,
         source_path=source_path,
-        checksum=checksum,
         raw_payload=conversation,
-        segments=segments,
+    )
+
+    return ingest_document(
+        conn,
+        parsed_doc,
+        segments,
+        ingest_batch_id=os.getenv("INGEST_BATCH_ID"),
+        ingested_by=os.getenv("INGESTED_BY") or os.getenv("USER"),
+        ingest_source="chatgpt",
+        ingest_version=os.getenv("INGEST_VERSION"),
     )
 
 

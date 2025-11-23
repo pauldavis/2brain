@@ -163,3 +163,33 @@ def search_hybrid_documents_endpoint(
         }
     )
     return results
+
+
+@router.get("/search/hybrid_documents_debug")
+def search_hybrid_documents_debug_endpoint(
+    q: str = Query(..., description="Free-form query aggregated to documents."),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    w_bm25: float = Query(0.5, ge=0.0, le=1.0),
+    w_vec: float = Query(0.5, ge=0.0, le=1.0),
+    k: int = Query(60, ge=1),
+    doc_topk: int = Query(3, ge=1, le=10),
+    doc_top_segments: int = Query(3, ge=1, le=10),
+    segment_limit: Optional[int] = Query(None, ge=10),
+    conn=Depends(get_connection),
+):
+    qvec = embed_query_openai(q)
+    results, meta = search_documents_hybrid_rrf(
+        conn,
+        q=q,
+        q_embedding=qvec,
+        limit=limit,
+        offset=offset,
+        w_bm25=w_bm25,
+        w_vec=w_vec,
+        k=k,
+        doc_topk=doc_topk,
+        doc_top_segments=doc_top_segments,
+        segment_limit=segment_limit,
+    )
+    return {"results": results, "meta": meta}

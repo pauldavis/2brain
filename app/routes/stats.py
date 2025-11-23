@@ -142,7 +142,13 @@ def stats_coverage(conn=Depends(get_connection)) -> Dict[str, Any]:
     data: Dict[str, Any] = {"ok": True}
     try:
         emb = conn.execute(
-            "SELECT embedding_status, COUNT(*) AS c FROM document_segments GROUP BY 1"
+            """
+            SELECT embedding_status, COUNT(*) AS c
+            FROM document_segments
+            WHERE is_noise = FALSE OR embedding_status = 'skipped_noise'
+            GROUP BY 1
+            ORDER BY 1
+            """
         ).fetchall()
         noise = conn.execute(
             "SELECT is_noise, COUNT(*) AS c FROM document_segments GROUP BY 1"

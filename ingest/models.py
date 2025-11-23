@@ -36,6 +36,7 @@ class SegmentInput:
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     raw_reference: Optional[str]
+    content_checksum: Optional[bytes] = None
     blocks: List[SegmentBlockInput] = field(default_factory=list)
     assets: List[SegmentAssetInput] = field(default_factory=list)
     quality_score: Optional[float] = None

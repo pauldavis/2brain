@@ -4,7 +4,7 @@ import string
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, Union
 
 import psycopg
 from psycopg.types.json import Json
@@ -90,10 +90,12 @@ def persist_document(
     raw_metadata: Mapping[str, object],
     source_path: str,
     checksum: bytes,
-    raw_payload: Mapping[str, object],
+    raw_payload: Union[Mapping[str, object], list],
     segments: Sequence[SegmentInput],
+    ingest_metadata: Mapping[str, object] | None = None,
 ) -> PersistResult:
     """Insert or update a document and its segments."""
+    ingest_metadata = ingest_metadata or {}
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -138,9 +140,13 @@ def persist_document(
                 document_id,
                 source_path,
                 checksum,
-                raw_payload
+                raw_payload,
+                ingest_batch_id,
+                ingested_by,
+                ingest_source,
+                ingest_version
             )
-            VALUES (%s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (document_id, checksum)
             DO NOTHING
             RETURNING id
@@ -150,6 +156,10 @@ def persist_document(
                 source_path,
                 checksum,
                 Json(raw_payload),
+                ingest_metadata.get("ingest_batch_id"),
+                ingest_metadata.get("ingested_by"),
+                ingest_metadata.get("ingest_source"),
+                ingest_metadata.get("ingest_version"),
             ),
         )
         version_row = cur.fetchone()
@@ -178,10 +188,13 @@ def persist_document(
             )
             if segment.is_noise:
                 is_noise = True
+                embedding_status_override = "skipped_noise"
             elif segment.quality_score is not None:
                 is_noise = segment.quality_score < QUALITY_NOISE_THRESHOLD
+                embedding_status_override = None
             else:
                 is_noise = auto_noise
+                embedding_status_override = None
             cur.execute(
                 """
                 INSERT INTO document_segments (
@@ -191,18 +204,20 @@ def persist_document(
                     source_role,
                     segment_type,
                     content_markdown,
+                    content_checksum,
                     content_plaintext,
                     content_json,
                     quality_score,
                     is_noise,
+                    embedding_status,
                     started_at,
                     ended_at,
                     raw_reference
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s,
                     to_tsvector('english', %s),
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id
                 """,
@@ -213,10 +228,12 @@ def persist_document(
                     segment.source_role,
                     segment.segment_type,
                     segment.content_markdown,
+                    segment.content_checksum,
                     segment.plaintext,
                     Json(segment.content_json) if segment.content_json is not None else None,
                     quality_score,
                     is_noise,
+                    embedding_status_override if is_noise else None,
                     segment.started_at,
                     segment.ended_at,
                     segment.raw_reference,

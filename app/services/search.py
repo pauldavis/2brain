@@ -4,11 +4,15 @@ from typing import List, Optional
 import os
 from uuid import UUID
 
+import logging
+
 from app.schemas import (
     DocumentSearchResult,
     SearchResult,
     SearchSegmentMatch,
 )
+
+logger = logging.getLogger(__name__)
 
 SEARCH_SQL = """
 WITH params AS (
@@ -264,6 +268,38 @@ ranked AS (
     ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY score DESC) AS doc_rank
   FROM limited_segments
 ),
+ranked_unique AS (
+  SELECT
+    document_id,
+    document_title,
+    source_system,
+    document_updated_at,
+    segment_count,
+    char_count,
+    segment_id,
+    sequence,
+    source_role,
+    snippet,
+    score,
+    doc_rank
+  FROM (
+    SELECT DISTINCT ON (document_id, segment_id)
+      document_id,
+      document_title,
+      source_system,
+      document_updated_at,
+      segment_count,
+      char_count,
+      segment_id,
+      sequence,
+      source_role,
+      snippet,
+      score,
+      doc_rank
+    FROM ranked
+    ORDER BY document_id, segment_id, doc_rank
+  ) deduped
+),
 doc_agg AS (
   SELECT
     document_id,
@@ -284,7 +320,7 @@ doc_agg AS (
             'snippet', snippet
         ) ORDER BY doc_rank
     ) FILTER (WHERE doc_rank <= %(doc_top_segments)s) AS top_segments
-  FROM ranked
+  FROM ranked_unique
   GROUP BY document_id
 )
 SELECT
@@ -470,6 +506,8 @@ def search_documents_hybrid_rrf(
         },
     ).fetchall()
     results: List[DocumentSearchResult] = []
+    duplicate_debug: list[dict] = []
+    segment_debug: list[dict] = []
     for row in rows:
         top_segments_raw = row["top_segments"] or []
         segment_matches = [
@@ -482,6 +520,35 @@ def search_documents_hybrid_rrf(
             )
             for segment in top_segments_raw
         ]
+        unique_segments: List[SearchSegmentMatch] = []
+        seen_segments: set[UUID] = set()
+        raw_ids: list[str] = []
+        for match in segment_matches:
+            raw_ids.append(str(match.segment_id))
+            if match.segment_id in seen_segments:
+                continue
+            seen_segments.add(match.segment_id)
+            unique_segments.append(match)
+        if len(unique_segments) != len(segment_matches):
+            duplicate_debug.append(
+                {
+                    "document_id": str(row["document_id"]),
+                    "raw_segments": raw_ids,
+                    "unique_segments": [str(seg.segment_id) for seg in unique_segments],
+                }
+            )
+            logger.warning(
+                "search_documents_hybrid_rrf: document %s had duplicate top segments before dedupe: %s",
+                row["document_id"],
+                raw_ids,
+            )
+        segment_debug.append(
+            {
+                "document_id": str(row["document_id"]),
+                "segment_ids": [str(seg.segment_id) for seg in unique_segments],
+                "segment_sequences": [seg.sequence for seg in unique_segments],
+            }
+        )
         results.append(
             DocumentSearchResult(
                 document_id=row["document_id"],
@@ -495,11 +562,16 @@ def search_documents_hybrid_rrf(
                 document_score=float(row["document_score"] or 0.0),
                 best_segment_score=float(row["best_segment_score"] or 0.0),
                 topk_score=float(row["topk_score"] or 0.0),
-                top_segments=segment_matches,
+                top_segments=unique_segments,
             )
         )
     best_score = rows[0]["best_segment_score"] if rows else None
-    return results, {"count": len(results), "best_score": best_score}
+    return results, {
+        "count": len(results),
+        "best_score": best_score,
+        "duplicate_debug": duplicate_debug,
+        "segment_debug": segment_debug,
+    }
 
 
 def embed_query_openai(text: str, *, model: str = "text-embedding-3-small") -> List[float]:

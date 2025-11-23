@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -16,8 +15,9 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
 
-from ingest.db import PersistResult, persist_document
+from ingest.db import PersistResult
 from ingest.models import SegmentAssetInput, SegmentInput
+from ingest.pipeline import ParsedDocument, ingest_document
 
 
 ATTACHMENT_KEYS = {
@@ -31,7 +31,7 @@ ATTACHMENT_KEYS = {
 @dataclass
 class ConversationFile:
     path: Path
-    payload: dict
+    payload: dict | list
 
 
 def timezone_from_timestamp(ts: Optional[float]) -> datetime:
@@ -87,6 +87,8 @@ def normalize_role(role: str | None) -> str:
 
 
 def build_segments(conversation: dict, conversation_id: str) -> List[SegmentInput]:
+    if not isinstance(conversation, dict):
+        return []
     segments: List[SegmentInput] = []
     chunks = conversation.get("chunkedPrompt", {}).get("chunks", [])
     for index, chunk in enumerate(chunks, start=1):
@@ -130,7 +132,7 @@ def build_segments(conversation: dict, conversation_id: str) -> List[SegmentInpu
             SegmentInput(
                 node_id=f"{conversation_id}-{index}",
                 parent_node_id=None,
-                sequence=index,
+                sequence=0,
                 source_role=role,
                 segment_type=segment_type,
                 content_markdown=content_markdown,
@@ -147,6 +149,67 @@ def build_segments(conversation: dict, conversation_id: str) -> List[SegmentInpu
     return segments
 
 
+def build_segments_from_simple_list(messages: List[dict], conversation_id: str) -> List[SegmentInput]:
+    """Fallback for simple exports that are just a list of {role, content_html} dicts."""
+    import re
+
+    segments: List[SegmentInput] = []
+    tag_re = re.compile(r"<[^>]+>")
+    for idx, msg in enumerate(messages, start=1):
+        role = normalize_role(msg.get("role"))
+        html = msg.get("content_html") or ""
+        plaintext = tag_re.sub(" ", html).strip()
+        segments.append(
+            SegmentInput(
+                node_id=f"{conversation_id}-{idx}",
+                parent_node_id=None,
+                sequence=0,
+                source_role=role,
+                segment_type="message",
+                content_markdown=plaintext or html,
+                plaintext=plaintext or html,
+                content_json=msg,
+                started_at=None,
+                ended_at=None,
+                raw_reference=str(idx),
+                blocks=[],
+                assets=[],
+                is_noise=False,
+            )
+        )
+    return segments
+ 
+ 
+def build_segments_from_chunked_prompt(conversation: dict, conversation_id: str) -> List[SegmentInput]:
+    """Handle chunkedPrompt exports that may include pending inputs."""
+    segments = build_segments(conversation, conversation_id)
+    pending_inputs = (
+        conversation.get("chunkedPrompt", {}).get("pendingInputs") or []
+    )
+    for idx, pending in enumerate(pending_inputs, start=len(segments) + 1):
+        text_content = pending.get("text") or ""
+        role = normalize_role(pending.get("role") or "user")
+        segments.append(
+            SegmentInput(
+                node_id=f"{conversation_id}-pending-{idx}",
+                parent_node_id=None,
+                sequence=0,
+                source_role=role,
+                segment_type="metadata",
+                content_markdown=text_content,
+                plaintext=text_content,
+                content_json=pending,
+                started_at=None,
+                ended_at=None,
+                raw_reference=f"pending-{idx}",
+                blocks=[],
+                assets=[],
+                is_noise=False,
+            )
+        )
+    return segments
+
+
 def ingest_conversation(
     conn: psycopg.Connection,
     conversation: ConversationFile,
@@ -154,26 +217,35 @@ def ingest_conversation(
 ) -> PersistResult:
     path = conversation.path
     payload = conversation.payload
-    stats = path.stat()
+    stat_target = path if path.exists() else root
+    stats = stat_target.stat()
     timestamps = timezone_from_timestamp(stats.st_mtime)
     title = path.name
     external_id = normalize_external_id(root, path)
     conversation_id = slugify(external_id)
-    segments = build_segments(payload, conversation_id)
+
+    if isinstance(payload, list):
+        segments = build_segments_from_simple_list(payload, conversation_id)
+    elif isinstance(payload, dict) and "chunkedPrompt" in payload:
+        segments = build_segments_from_chunked_prompt(payload, conversation_id)
+    elif isinstance(payload, dict) and payload.get("role") and payload.get("content_html"):
+        segments = build_segments_from_simple_list([payload], conversation_id)
+    else:
+        segments = []
+    if not segments:
+        raise RuntimeError(f"No segments parsed from {conversation.path}")
 
     raw_metadata: Dict[str, object] = {
         "export_path": external_id,
-        "runSettings": payload.get("runSettings"),
-        "systemInstruction": payload.get("systemInstruction"),
-        "pendingInputs": payload.get("chunkedPrompt", {}).get("pendingInputs"),
+        "runSettings": payload.get("runSettings") if isinstance(payload, dict) else None,
+        "systemInstruction": payload.get("systemInstruction") if isinstance(payload, dict) else None,
+        "pendingInputs": payload.get("chunkedPrompt", {}).get("pendingInputs")
+        if isinstance(payload, dict) and isinstance(payload.get("chunkedPrompt"), dict)
+        else None,
         "source_system": "aistudio",
     }
 
-    checksum_input = json.dumps(payload, sort_keys=True).encode("utf-8")
-    checksum = hashlib.sha256(checksum_input).digest()
-
-    return persist_document(
-        conn,
+    parsed_doc = ParsedDocument(
         source_system="other",
         external_id=external_id,
         title=title,
@@ -182,9 +254,17 @@ def ingest_conversation(
         updated_at=timestamps,
         raw_metadata=raw_metadata,
         source_path=str(path),
-        checksum=checksum,
         raw_payload=payload,
-        segments=segments,
+    )
+
+    return ingest_document(
+        conn,
+        parsed_doc,
+        segments,
+        ingest_batch_id=os.getenv("INGEST_BATCH_ID"),
+        ingested_by=os.getenv("INGESTED_BY") or os.getenv("USER"),
+        ingest_source="google",
+        ingest_version=os.getenv("INGEST_VERSION"),
     )
 
 
@@ -235,12 +315,25 @@ def run_cli() -> None:
 
     export_dir = args.export or args.export_path
     if export_dir is None:
-        parser.error("Provide the export directory as a positional argument or via --export.")
+        parser.error("Provide the export path (file or directory) as a positional argument or via --export.")
     export_dir = export_dir.expanduser().resolve()
-    if not export_dir.exists() or not export_dir.is_dir():
-        raise FileNotFoundError(f"Export directory {export_dir} was not found or is not a directory.")
-
-    conversations = discover_conversations(export_dir)
+    if export_dir.is_file():
+        try:
+            payload = json.loads(export_dir.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(f"Failed to read JSON export file {export_dir}") from exc
+        conversations: List[ConversationFile] = []
+        if isinstance(payload, list):
+            # Wrap list payload as a single conversation; parsed later by list-aware logic.
+            conversations = [ConversationFile(path=export_dir, payload=payload)]
+        elif isinstance(payload, dict):
+            conversations = [ConversationFile(path=export_dir, payload=payload)]
+        else:
+            raise RuntimeError(f"Unsupported JSON payload shape in {export_dir}")
+    elif export_dir.is_dir():
+        conversations = discover_conversations(export_dir)
+    else:
+        raise FileNotFoundError(f"Export path {export_dir} was not found.")
     if args.limit is not None:
         conversations = conversations[: args.limit]
 
