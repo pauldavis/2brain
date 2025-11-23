@@ -149,14 +149,6 @@
         <option value="hybrid">Hybrid (BM25 + Vector)</option>
       </select>
       <button class="btn btn-primary" onclick={(e)=>{ e.preventDefault(); run(); }} disabled={loading || !q.trim()}>Search</button>
-      <button class="btn" onclick={(e)=>{ e.preventDefault(); explain(); }} disabled={planLoading || !q.trim()}>
-        {#if planLoading}<span class="loading loading-spinner loading-sm"></span>{/if}
-        Explain query
-      </button>
-      <label class="label cursor-pointer gap-2 text-slate-600">
-        <input type="checkbox" class="toggle toggle-sm" bind:checked={analyzePlan} />
-        <span class="label-text text-xs">Analyze (executes query)</span>
-      </label>
     </div>
 
     {#if mode === 'bm25'}
@@ -182,24 +174,47 @@
   <section class="rounded-xl border border-dashed border-slate-300 bg-white/60 p-4">
     <h2 class="text-lg font-semibold text-slate-900">Instrumentation</h2>
     <p class="text-sm text-slate-600">Use "Explain query" to inspect planner output for the current mode/parameters.</p>
+    <div class="mt-3 flex flex-wrap items-center gap-3">
+      <button class="btn" onclick={(e)=>{ e.preventDefault(); explain(); }} disabled={planLoading || !q.trim()}>
+        {#if planLoading}<span class="loading loading-spinner loading-sm"></span>{/if}
+        Explain query
+      </button>
+      <label class="label cursor-pointer gap-2 text-slate-600">
+        <input type="checkbox" class="toggle toggle-sm" bind:checked={analyzePlan} />
+        <span class="label-text text-xs">Analyze (executes query)</span>
+      </label>
+    </div>
     {#if planError}
       <div class="alert alert-error mt-3 bg-rose-50 text-rose-600">{planError}</div>
     {/if}
     {#if plan}
-      <div class="mt-3 grid gap-4 md:grid-cols-2">
-        <div class="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-600 space-y-1">
-          <div><span class="font-semibold">Mode:</span> {plan.metadata?.mode}</div>
-          <div><span class="font-semibold">Planning:</span> {plan.planning_time_ms ?? '—'} ms</div>
-          <div><span class="font-semibold">Execution:</span> {plan.execution_time_ms ?? (analyzePlan ? 'n/a' : 'plan only')}</div>
-          <div><span class="font-semibold">Limit/Offset:</span> {plan.metadata?.limit}/{plan.metadata?.offset}</div>
+      <details class="mt-3 rounded-lg border border-slate-200 bg-white" open>
+        <summary class="flex items-center justify-between gap-3 cursor-pointer px-4 py-2 text-sm text-slate-700">
+          <div>
+            <span class="font-semibold">Latest plan</span>
+            <span class="ml-2 text-xs text-slate-500">({plan.metadata?.mode})</span>
+          </div>
+          <button class="btn btn-xs" onclick={(e)=>{ e.preventDefault(); navigator.clipboard?.writeText(JSON.stringify(plan, null, 2)); }}>
+            Copy JSON
+          </button>
+        </summary>
+        <div class="border-t border-slate-200 p-4">
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-600 space-y-1">
+              <div><span class="font-semibold">Mode:</span> {plan.metadata?.mode}</div>
+              <div><span class="font-semibold">Planning:</span> {plan.planning_time_ms ?? '—'} ms</div>
+              <div><span class="font-semibold">Execution:</span> {plan.execution_time_ms ?? (analyzePlan ? 'n/a' : 'plan only')}</div>
+              <div><span class="font-semibold">Limit/Offset:</span> {plan.metadata?.limit}/{plan.metadata?.offset}</div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-600 overflow-auto">
+              <pre class="text-xs whitespace-pre-wrap">{JSON.stringify(plan.metadata, null, 2)}</pre>
+            </div>
+          </div>
+          <div class="mt-4 rounded-lg border border-slate-200 bg-slate-900/5 p-3 text-xs overflow-auto">
+            <pre>{JSON.stringify(plan.plan, null, 2)}</pre>
+          </div>
         </div>
-        <div class="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-600 overflow-auto">
-          <pre class="text-xs whitespace-pre-wrap">{JSON.stringify(plan.metadata, null, 2)}</pre>
-        </div>
-      </div>
-      <div class="mt-4 rounded-lg border border-slate-200 bg-slate-900/5 p-3 text-xs overflow-auto">
-        <pre>{JSON.stringify(plan.plan, null, 2)}</pre>
-      </div>
+      </details>
     {:else}
       <div class="mt-3 text-sm text-slate-500">No plan captured yet.</div>
     {/if}
@@ -266,8 +281,16 @@
                 {#if doc.top_segments.findIndex((s) => s.segment_id === segment.segment_id) === index}
                 <div class="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-1">
                   <div class="flex flex-wrap items-center justify-between text-xs uppercase tracking-wide text-slate-500 gap-2">
-                    <span>Segment {segment.sequence} · {segment.source_role}</span>
-                    <span>Score {segment.score.toFixed(3)}</span>
+                    <span>{segment.sequence} · {segment.source_role}</span>
+                    <div class="flex items-center gap-2">
+                      <span>Score {segment.score.toFixed(3)}</span>
+                      <button
+                        class="btn btn-ghost btn-xs text-slate-500"
+                        title={`Started: ${segment.started_at ?? '—'}\nEnded: ${segment.ended_at ?? '—'}\nRaw reference: ${segment.raw_reference ?? '—'}`}
+                      >
+                        ⓘ
+                      </button>
+                    </div>
                   </div>
                   <div class="markdown text-sm whitespace-pre-line wrap-break-word">
                     {renderSnippet(segment.snippet)}

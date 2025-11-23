@@ -622,35 +622,84 @@ function sanitizeSummary(raw: string): string {
 				</div>
 			</section>
 
-				{#if viewMode === 'document'}
-					<section class="card rounded-lg border border-slate-200 bg-white shadow-xl">
-						<div class="card-body">
-							<div class="flex items-center justify-between">
-								<h3 class="text-lg font-semibold text-slate-900">Whole document</h3>
-								{#if transcriptDownloadUrl}
-									<a class="btn btn-sm btn-outline" href={transcriptDownloadUrl} target="_blank" rel="noreferrer">
-										Export
-									</a>
-								{/if}
-							</div>
-							{#if isTranscriptLoading}
-								<div class="alert alert-info rounded-md bg-white text-slate-600">
-									<span>Rendering full document…</span>
-								</div>
-							{:else if transcriptError}
-								<div class="alert alert-error rounded-md bg-white text-slate-600">
-									<span>{transcriptError}</span>
-								</div>
-							{:else if transcript && transcript.document.id === selectedDocumentId}
-								<div class="markdown prose max-w-none">
-									{@html renderMarkdown(transcript.markdown)}
-								</div>
-							{:else}
-								<p class="text-sm text-slate-500">Preparing full document…</p>
-							{/if}
-						</div>
-					</section>
-				{:else if viewMode === 'sections'}
+                {#if viewMode === 'document'}
+                    <section class="card rounded-lg border border-slate-200 bg-white shadow-xl">
+                        <div class="card-body space-y-6">
+                            <div class="flex items-center justify-between">
+                                <h3 class="text-lg font-semibold text-slate-900">Whole document</h3>
+                                {#if transcriptDownloadUrl}
+                                    <a class="btn btn-sm btn-outline" href={transcriptDownloadUrl} target="_blank" rel="noreferrer">
+                                        Export
+                                    </a>
+                                {/if}
+                            </div>
+                            {#if !selectedDocument}
+                                <p class="text-sm text-slate-500">Select a document to view its contents.</p>
+                            {:else}
+                                <div class="space-y-2 text-sm text-slate-600">
+                                    <div class="text-xl font-semibold text-slate-900">{selectedDocument.document.title}</div>
+                                    <ul class="list-disc space-y-1 pl-5">
+                                        <li>Source system: {selectedDocument.document.source_system}</li>
+                                        <li>External ID: {selectedDocument.document.external_id}</li>
+                                        <li>Segment count: {selectedDocument.segments.length}</li>
+                                        <li>Created: {formatDate(selectedDocument.document.created_at)}</li>
+                                        <li>Updated: {formatDate(selectedDocument.document.updated_at)}</li>
+                                        <li>Last ingested: {formatDate(selectedDocument.version.ingested_at)}</li>
+                                    </ul>
+                                </div>
+                                <div class="space-y-6">
+                                    {#each selectedDocument.segments as segment, index}
+                                        <article class="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                                            <div class="flex flex-wrap items-start justify-between gap-3">
+                                                <div class="space-y-1">
+                                                    <div class="text-base font-semibold text-slate-900">
+                                                        {index + 1} · {roleLabel(segment.source_role)} ({segment.segment_type})
+                                                    </div>
+                                                    <div class="text-xs uppercase tracking-wide text-slate-500">
+                                                        Updated {formatDate(segment.started_at)}
+                                                    </div>
+                                                </div>
+                                                <div class="flex items-center gap-2 text-xs text-slate-500">
+                                                    <button class="btn btn-xs btn-outline" onclick={() => downloadSegment(segment.id)}>
+                                                        Export
+                                                    </button>
+                                                    <button
+                                                        class="btn btn-ghost btn-xs"
+                                                        title={`Started: ${formatDate(segment.started_at)}\nEnded: ${formatDate(segment.ended_at)}\nRaw reference: ${segment.raw_reference ?? '—'}`}
+                                                    >
+                                                        ⓘ
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="markdown text-sm wrap-break-word">
+                                                {@html renderMarkdown(segment.content_markdown ?? '')}
+                                            </div>
+                                            {#if segment.assets?.length}
+                                                <div class="space-y-3 rounded-lg border border-slate-200 bg-white/70 p-3">
+                                                    <h4 class="text-xs font-semibold uppercase tracking-wide text-slate-500">Attachments</h4>
+                                                    <ul class="space-y-2">
+                                                        {#each segment.assets as asset}
+                                                            <li class="rounded border border-slate-200 bg-white p-2 text-sm text-slate-600 flex flex-wrap items-center justify-between gap-2">
+                                                                <div class="space-x-2">
+                                                                    <span class="font-semibold">{asset.file_name ?? 'Unnamed asset'}</span>
+                                                                    {#if asset.mime_type}<span class="text-xs text-slate-500">({asset.mime_type})</span>{/if}
+                                                                    {#if formatBytes(asset.size_bytes)}<span class="text-xs text-slate-500">· {formatBytes(asset.size_bytes)}</span>{/if}
+                                                                </div>
+                                                                {#if asset.has_content}
+                                                                    <a class="btn btn-xs btn-outline" href={attachmentUrl(asset, true) ?? '#'} target="_blank" rel="noreferrer">Download</a>
+                                                                {/if}
+                                                            </li>
+                                                        {/each}
+                                                    </ul>
+                                                </div>
+                                            {/if}
+                                        </article>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </div>
+                    </section>
+                {:else if viewMode === 'sections'}
 					{#if currentSegment}
 						<section class="space-y-4">
 							<div class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3">

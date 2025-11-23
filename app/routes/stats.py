@@ -14,31 +14,48 @@ router = APIRouter(tags=["stats"])
 
 @router.get("/stats/vectorizer")
 def stats_vectorizer(conn=Depends(get_connection)) -> Dict[str, Any]:
-    data: Dict[str, Any] = {"ok": True}
+    data: Dict[str, Any] = {"ok": True, "vectorizers": []}
     try:
+        view_exists = conn.execute("SELECT to_regclass('ai.vectorizer_status')").fetchone()[0]
+        if view_exists is None:
+            data["message"] = "pgai vectorizer metadata is not installed (missing ai.vectorizer_status)."
+            return data
+
         vs = conn.execute("SELECT * FROM ai.vectorizer_status").fetchall()
         rows = [dict(r) for r in vs]
         data["vectorizers"] = rows
-        if rows:
-            name = rows[0]["name"]
+        if not rows:
+            data["message"] = "No vectorizers registered. Run ai.create_vectorizer first."
+            return data
+
+        name = rows[0]["name"]
+        try:
             pending_exact = conn.execute(
                 "SELECT ai.vectorizer_queue_pending(%s, true)", (name,)
             ).fetchone()[0]
             data["pending_exact"] = int(pending_exact)
-            vid = rows[0]["id"]
-            errs = conn.execute(
-                """
-                SELECT recorded, message, details
-                FROM ai.vectorizer_errors
-                WHERE id = %s
-                ORDER BY recorded DESC
-                LIMIT 20
-                """,
-                (vid,),
-            ).fetchall()
-            data["errors"] = [dict(r) for r in errs]
+        except Exception as pending_err:  # pragma: no cover - helper may be absent
+            data.setdefault("warnings", []).append(
+                f"Could not query ai.vectorizer_queue_pending: {pending_err}"
+            )
+
+        vid = rows[0]["id"]
+        errs = conn.execute(
+            """
+            SELECT recorded, message, details
+            FROM ai.vectorizer_errors
+            WHERE id = %s
+            ORDER BY recorded DESC
+            LIMIT 20
+            """,
+            (vid,),
+        ).fetchall()
+        data["errors"] = [dict(r) for r in errs]
     except Exception as e:  # pragma: no cover
-        data = {"ok": False, "error": str(e)}
+        data = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
     return data
 
 
@@ -46,20 +63,45 @@ def stats_vectorizer(conn=Depends(get_connection)) -> Dict[str, Any]:
 def stats_bm25(conn=Depends(get_connection)) -> Dict[str, Any]:
     data: Dict[str, Any] = {"ok": True}
     try:
+        idx_row = conn.execute(
+            "SELECT to_regclass('public.document_segments_bm25_idx') AS idx_oid"
+        ).fetchone()
+        idx_oid = idx_row["idx_oid"] if idx_row else None
+        if idx_oid is None:
+            data["message"] = "BM25 index document_segments_bm25_idx is missing. Run db/bm25_document_segments.sql."
+            data["usage"] = None
+            data["size"] = None
+            data["table_stats"] = None
+            return data
+
         idx = conn.execute(
             """
-            SELECT indexrelname, idx_scan, last_analyze, last_vacuum
+            SELECT *
             FROM pg_stat_user_indexes
             WHERE indexrelname = 'document_segments_bm25_idx'
             """
         ).fetchone()
         data["usage"] = dict(idx) if idx else None
-        size = conn.execute(
-            "SELECT pg_size_pretty(pg_relation_size('public.document_segments_bm25_idx'))"
+        size_row = conn.execute(
+            """
+            SELECT pg_size_pretty(pg_relation_size('public.document_segments_bm25_idx')) AS size
+            """
         ).fetchone()
-        data["size"] = size[0] if size else None
+        data["size"] = size_row["size"] if size_row else None
+
+        table_stats = conn.execute(
+            """
+            SELECT relname, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze
+            FROM pg_stat_user_tables
+            WHERE relname = 'document_segments'
+            """
+        ).fetchone()
+        data["table_stats"] = dict(table_stats) if table_stats else None
     except Exception as e:  # pragma: no cover
-        data = {"ok": False, "error": str(e)}
+        data = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
     return data
 
 
@@ -129,7 +171,7 @@ def stats_search_plan(
             "plan": plan,
         }
     except Exception as exc:  # pragma: no cover - diagnostic endpoint
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 @router.get("/stats/queries")
@@ -164,11 +206,18 @@ def stats_coverage(conn=Depends(get_connection)) -> Dict[str, Any]:
 def stats_table(conn=Depends(get_connection)) -> Dict[str, Any]:
     data: Dict[str, Any] = {"ok": True}
     try:
-        size = conn.execute(
-            "SELECT pg_size_pretty(pg_total_relation_size('public.document_segments'))"
-        ).fetchone()[0]
-        count = conn.execute("SELECT COUNT(*) FROM public.document_segments").fetchone()[0]
-        data.update({"table_size": size, "rows": int(count)})
+        size_row = conn.execute(
+            "SELECT pg_size_pretty(pg_total_relation_size('public.document_segments')) AS size"
+        ).fetchone()
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM public.document_segments"
+        ).fetchone()
+        size = size_row["size"] if size_row else None
+        count = count_row["count"] if count_row else None
+        data.update({"table_size": size, "rows": int(count) if count is not None else None})
     except Exception as e:  # pragma: no cover
-        data = {"ok": False, "error": str(e)}
+        data = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
     return data
