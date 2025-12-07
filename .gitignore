@@ -1,5 +1,12 @@
 .env
 
+# Sensitive Data & Exports
+docs/samples/
+*.zip
+*.sql
+*.sqlite
+*.db
+
 docs/reference/pgai/
 
 # Byte-compiled / optimized / DLL files
