@@ -1,7 +1,8 @@
 <script lang="ts">
-	import type { PageData } from './$types';
-	import type { DocumentSummary, DocumentTranscript, DocumentView, Segment, SegmentAsset } from '$lib/types';
-	import { marked } from 'marked';
+import type { PageData } from './$types';
+import type { DocumentSummary, DocumentTranscript, DocumentView, Segment, SegmentAsset } from '$lib/types';
+import { marked } from 'marked';
+import { onMount } from 'svelte';
 
 	const props = $props<{ data: PageData }>();
 	const data = $state(props.data);
@@ -15,10 +16,22 @@
 	);
 
 	let selectedDocument = $state<DocumentView | null>(data.initialDocument);
-	const selectedDocumentId = $derived<string | null>(selectedDocument?.document.id ?? null);
-	let selectedSegmentIndex = $state(0);
-	let isLoadingDocument = $state(false);
-	let loadError = $state('');
+const selectedDocumentId = $derived<string | null>(selectedDocument?.document.id ?? null);
+let selectedSegmentIndex = $state(0);
+let isLoadingDocument = $state(false);
+let loadError = $state('');
+const initialHydrationStart = typeof performance !== 'undefined' ? performance.now() : 0;
+let initialDocumentLogged = false;
+let navigationStartFromSearch: number | null = null;
+let navigationHydrationLogged = false;
+
+onMount(() => {
+    const raw = window.sessionStorage.getItem('docNavStart');
+    if (raw) {
+        navigationStartFromSearch = Number(raw);
+        window.sessionStorage.removeItem('docNavStart');
+    }
+});
 	type ViewMode = 'document' | 'sections';
 	let viewMode = $state<ViewMode>('sections');
 	let sidebarOpen = $state(true);
@@ -137,12 +150,13 @@
 		return `${current.toFixed(precision)} ${units[unitIndex]}`;
 	}
 
-	async function selectDocument(id: string, segmentId?: string | null) {
-		if (id === selectedDocumentId) return;
-		isLoadingDocument = true;
-		loadError = '';
-		try {
-			const res = await fetch(`${API_BASE}/documents/${id}`);
+async function selectDocument(id: string, segmentId?: string | null) {
+    if (id === selectedDocumentId) return;
+    const t0 = performance.now();
+    isLoadingDocument = true;
+    loadError = '';
+    try {
+        const res = await fetch(`${API_BASE}/documents/${id}`);
 			if (!res.ok) {
 				throw new Error(`Failed to load document (${res.status})`);
 			}
@@ -150,36 +164,41 @@
 				selectedDocument = doc;
 				selectedSegmentIndex = 0;
 				pendingSegmentId = segmentId ?? null;
-				transcript = null;
-				transcriptError = '';
-				viewMode = 'sections';
-		} catch (error) {
-			console.error(error);
-			loadError = error instanceof Error ? error.message : 'Unknown error while loading document.';
-		} finally {
-			isLoadingDocument = false;
-		}
-	}
+                transcript = null;
+                transcriptError = '';
+                viewMode = 'sections';
+                console.log(`[document] id=${id} fetched in ${Math.round(performance.now() - t0)}ms`);
+    } catch (error) {
+        console.error(error);
+        loadError = error instanceof Error ? error.message : 'Unknown error while loading document.';
+        console.log(`[document] id=${id} failed after ${Math.round(performance.now() - t0)}ms`, error);
+    } finally {
+        isLoadingDocument = false;
+    }
+}
 
-	async function loadTranscript(force = false) {
-		if (!selectedDocumentId || !selectedDocument) return;
-		if (transcript && transcript.document.id === selectedDocumentId && !force) return;
-		isTranscriptLoading = true;
-		transcriptError = '';
-		try {
+async function loadTranscript(force = false) {
+    if (!selectedDocumentId || !selectedDocument) return;
+    if (transcript && transcript.document.id === selectedDocumentId && !force) return;
+    const t0 = performance.now();
+    isTranscriptLoading = true;
+    transcriptError = '';
+    try {
 			const res = await fetch(`${API_BASE}/documents/${selectedDocumentId}/transcript`);
 			if (!res.ok) {
 				throw new Error(`Failed to load transcript (${res.status})`);
 			}
-			const payload: DocumentTranscript = await res.json();
-			transcript = payload;
-		} catch (error) {
-			console.error(error);
-			transcriptError = error instanceof Error ? error.message : 'Unknown error while loading transcript.';
-		} finally {
-			isTranscriptLoading = false;
-		}
-	}
+            const payload: DocumentTranscript = await res.json();
+            transcript = payload;
+            console.log(`[transcript] document=${selectedDocumentId} fetched in ${Math.round(performance.now() - t0)}ms`);
+    } catch (error) {
+        console.error(error);
+        transcriptError = error instanceof Error ? error.message : 'Unknown error while loading transcript.';
+        console.log(`[transcript] document=${selectedDocumentId} failed after ${Math.round(performance.now() - t0)}ms`, error);
+    } finally {
+        isTranscriptLoading = false;
+    }
+}
 
 	function previousSegment() {
 		if (!selectedDocument || visibleSegments.length === 0) return;
@@ -399,19 +418,36 @@ function sanitizeSummary(raw: string): string {
 		}
 	});
 
-	$effect(() => {
-		if (!pendingSegmentId) return;
-		const idx = visibleSegments.findIndex((segment) => segment.id === pendingSegmentId);
-		if (idx >= 0) {
-			selectedSegmentIndex = idx;
-			pendingSegmentId = null;
-		}
-	});
+$effect(() => {
+    if (!pendingSegmentId) return;
+    const idx = visibleSegments.findIndex((segment) => segment.id === pendingSegmentId);
+    if (idx >= 0) {
+        selectedSegmentIndex = idx;
+        pendingSegmentId = null;
+    }
+});
 
-	$effect(() => {
-		if (viewMode !== 'document') return;
-		if (!selectedDocumentId) return;
-		if (isTranscriptLoading) return;
+$effect(() => {
+    if (!initialDocumentLogged && selectedDocument && !isLoadingDocument) {
+        initialDocumentLogged = true;
+        if (initialHydrationStart) {
+            console.log(
+                `[document] id=${selectedDocument.document.id} hydrated in ${Math.round(performance.now() - initialHydrationStart)}ms`
+            );
+        }
+        if (!navigationHydrationLogged && navigationStartFromSearch) {
+            navigationHydrationLogged = true;
+            console.log(
+                `[document] navigation (search→render) took ${Date.now() - navigationStartFromSearch}ms`
+            );
+        }
+    }
+});
+
+$effect(() => {
+    if (viewMode !== 'document') return;
+    if (!selectedDocumentId) return;
+    if (isTranscriptLoading) return;
 		if (transcript && transcript.document.id === selectedDocumentId) return;
 		loadTranscript(false);
 	});

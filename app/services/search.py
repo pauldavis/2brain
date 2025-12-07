@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from typing import List, Optional
+import logging
 import os
+from typing import List, Optional
 from uuid import UUID
 
-import logging
-
+from app.config import get_settings
 from app.schemas import (
     DocumentSearchResult,
     SearchResult,
-    SearchSegmentMatch,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,158 +190,22 @@ ORDER BY sc.score DESC
 LIMIT %(limit)s OFFSET %(offset)s;
 """
 
-RRF_DOCUMENT_SQL = """
-WITH bm AS (
-  SELECT segment_id,
-         ROW_NUMBER() OVER (ORDER BY score) AS r
-  FROM (
-    SELECT ds.id AS segment_id,
-           ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx') AS score
-    FROM public.document_segments ds
-    WHERE ds.embedding_status = 'ready'
-      AND ds.is_noise = FALSE
-    ORDER BY score
-    LIMIT %(k)s
-  ) ranked
-),
-vec AS (
-  SELECT segment_id,
-         ROW_NUMBER() OVER (ORDER BY dist) AS r
-  FROM (
-    SELECT ds.id AS segment_id,
-           ds.embedding <=> %(qvec)s::vector AS dist
-    FROM public.document_segments ds
-    WHERE ds.embedding IS NOT NULL
-      AND ds.embedding_status = 'ready'
-      AND ds.is_noise = FALSE
-    ORDER BY dist
-    LIMIT %(k)s
-  ) ranked
-),
-scores AS (
-  SELECT segment_id,
-         SUM(rrf) AS score
-  FROM (
-    SELECT b.segment_id, %(w_bm25)s * (1.0 / (%(k)s + b.r)) AS rrf FROM bm b
-    UNION ALL
-    SELECT v.segment_id, %(w_vec)s  * (1.0 / (%(k)s + v.r)) AS rrf FROM vec v
-  ) s
-  GROUP BY segment_id
-),
-segments AS (
-  SELECT
-    d.id AS document_id,
-    d.title AS document_title,
-    d.source_system,
-    d.updated_at AS document_updated_at,
-    ds.id AS segment_id,
-    ds.sequence,
-    ds.source_role,
-    LEFT(ds.content_markdown, 280) AS snippet,
-    sc.score,
-    stats.segment_count,
-    stats.char_count,
-    ROW_NUMBER() OVER (ORDER BY sc.score DESC) AS global_rank
-  FROM scores sc
-  JOIN public.document_segments ds ON ds.id = sc.segment_id
-  JOIN public.document_versions dv ON dv.id = ds.document_version_id
-  JOIN public.documents d ON d.id = dv.document_id
-  JOIN LATERAL (
-      SELECT
-          COUNT(*) AS segment_count,
-          COALESCE(SUM(NULLIF(length(ds_all.content_markdown), 0)), 0) AS char_count
-      FROM document_segments ds_all
-      WHERE ds_all.document_version_id = dv.id
-  ) stats ON TRUE
-  WHERE ds.embedding_status = 'ready'
-    AND ds.is_noise = FALSE
-),
-limited_segments AS (
-  SELECT *
-  FROM segments
-  WHERE global_rank <= %(segment_limit)s
-),
-ranked AS (
-  SELECT
-    *,
-    ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY score DESC) AS doc_rank
-  FROM limited_segments
-),
-ranked_unique AS (
-  SELECT
-    document_id,
-    document_title,
-    source_system,
-    document_updated_at,
-    segment_count,
-    char_count,
-    segment_id,
-    sequence,
-    source_role,
-    snippet,
-    score,
-    doc_rank
-  FROM (
-    SELECT DISTINCT ON (document_id, segment_id)
-      document_id,
-      document_title,
-      source_system,
-      document_updated_at,
-      segment_count,
-      char_count,
-      segment_id,
-      sequence,
-      source_role,
-      snippet,
-      score,
-      doc_rank
-    FROM ranked
-    ORDER BY document_id, segment_id, doc_rank
-  ) deduped
-),
-doc_agg AS (
-  SELECT
-    document_id,
-    MAX(document_title) AS document_title,
-    MAX(source_system) AS source_system,
-    MAX(document_updated_at) AS document_updated_at,
-    MAX(segment_count) AS segment_count,
-    MAX(char_count) AS char_count,
-    COUNT(*) AS match_count,
-    MAX(score) AS best_segment_score,
-    SUM(score) FILTER (WHERE doc_rank <= %(doc_topk)s) AS topk_score,
-    JSONB_AGG(
-        JSONB_BUILD_OBJECT(
-            'segment_id', segment_id,
-            'sequence', sequence,
-            'source_role', source_role,
-            'score', score,
-            'snippet', snippet
-        ) ORDER BY doc_rank
-    ) FILTER (WHERE doc_rank <= %(doc_top_segments)s) AS top_segments
-  FROM ranked_unique
-  GROUP BY document_id
-)
-SELECT
-  document_id,
-  document_title,
-  source_system,
-  document_updated_at,
-  segment_count,
-  char_count,
-  match_count,
-  COALESCE(topk_score, 0.0) AS topk_score,
-  best_segment_score,
-  COALESCE(match_count::float / NULLIF(segment_count, 0), 0.0) AS match_density,
-  (
-    %(w_best)s * best_segment_score
-    + %(w_topk)s * COALESCE(topk_score, 0.0)
-    + %(w_density)s * COALESCE(match_count::float / NULLIF(segment_count, 0), 0.0)
-  ) AS document_score,
-  COALESCE(top_segments, '[]'::jsonb) AS top_segments
-FROM doc_agg
-ORDER BY document_score DESC
-LIMIT %(limit)s OFFSET %(offset)s;
+HYBRID_DOCS_JSON_SQL = """
+SELECT api.search_hybrid_documents_json(
+    %(q)s::text,
+    %(qvec)s::vector,
+    %(w_bm25)s::double precision,
+    %(w_vec)s::double precision,
+    %(k)s::integer,
+    %(limit)s::integer,
+    %(offset)s::integer,
+    %(doc_topk)s::integer,
+    %(doc_top_segments)s::integer,
+    %(segment_limit)s::integer,
+    %(w_best)s::double precision,
+    %(w_topk)s::double precision,
+    %(w_density)s::double precision
+) AS payload;
 """
 
 
@@ -487,8 +350,8 @@ def search_documents_hybrid_rrf(
     doc_score_w_density: float = 0.1,
 ) -> tuple[List[DocumentSearchResult], dict]:
     segment_limit = segment_limit or max(limit * max(doc_topk, doc_top_segments), 50)
-    rows = conn.execute(
-        RRF_DOCUMENT_SQL,
+    row = conn.execute(
+        HYBRID_DOCS_JSON_SQL,
         {
             "q": q,
             "qvec": _format_vector_literal(q_embedding),
@@ -504,77 +367,21 @@ def search_documents_hybrid_rrf(
             "limit": limit,
             "offset": offset,
         },
-    ).fetchall()
-    results: List[DocumentSearchResult] = []
-    duplicate_debug: list[dict] = []
-    segment_debug: list[dict] = []
-    for row in rows:
-        top_segments_raw = row["top_segments"] or []
-        segment_matches = [
-            SearchSegmentMatch(
-                segment_id=segment["segment_id"],
-                sequence=int(segment["sequence"]),
-                source_role=segment["source_role"],
-                score=float(segment["score"]),
-                snippet=segment.get("snippet") or "",
-            )
-            for segment in top_segments_raw
-        ]
-        unique_segments: List[SearchSegmentMatch] = []
-        seen_segments: set[UUID] = set()
-        raw_ids: list[str] = []
-        for match in segment_matches:
-            raw_ids.append(str(match.segment_id))
-            if match.segment_id in seen_segments:
-                continue
-            seen_segments.add(match.segment_id)
-            unique_segments.append(match)
-        if len(unique_segments) != len(segment_matches):
-            duplicate_debug.append(
-                {
-                    "document_id": str(row["document_id"]),
-                    "raw_segments": raw_ids,
-                    "unique_segments": [str(seg.segment_id) for seg in unique_segments],
-                }
-            )
-            logger.warning(
-                "search_documents_hybrid_rrf: document %s had duplicate top segments before dedupe: %s",
-                row["document_id"],
-                raw_ids,
-            )
-        segment_debug.append(
-            {
-                "document_id": str(row["document_id"]),
-                "segment_ids": [str(seg.segment_id) for seg in unique_segments],
-                "segment_sequences": [seg.sequence for seg in unique_segments],
-            }
-        )
-        results.append(
-            DocumentSearchResult(
-                document_id=row["document_id"],
-                document_title=row["document_title"],
-                source_system=row["source_system"],
-                document_updated_at=row["document_updated_at"],
-                document_segment_count=row["segment_count"],
-                document_char_count=row["char_count"],
-                match_count=row["match_count"],
-                match_density=float(row["match_density"] or 0.0),
-                document_score=float(row["document_score"] or 0.0),
-                best_segment_score=float(row["best_segment_score"] or 0.0),
-                topk_score=float(row["topk_score"] or 0.0),
-                top_segments=unique_segments,
-            )
-        )
-    best_score = rows[0]["best_segment_score"] if rows else None
+    ).fetchone()
+    payload = row["payload"] if row else None
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
     return results, {
-        "count": len(results),
-        "best_score": best_score,
-        "duplicate_debug": duplicate_debug,
-        "segment_debug": segment_debug,
+        "count": meta.get("count", 0),
+        "best_score": meta.get("best_score"),
+        "duplicate_debug": meta.get("duplicate_debug", []),
+        "segment_debug": meta.get("segment_debug", []),
     }
 
 
-def embed_query_openai(text: str, *, model: str = "text-embedding-3-small") -> List[float]:
+def embed_query_openai(
+    text: str, *, model: str = "text-embedding-3-small"
+) -> List[float]:
     try:
         from openai import OpenAI  # type: ignore
     except Exception as e:  # pragma: no cover - optional dependency
@@ -582,7 +389,7 @@ def embed_query_openai(text: str, *, model: str = "text-embedding-3-small") -> L
             "openai package not available. Install `openai>=1.0` to embed queries."
         ) from e
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = get_settings().openai_api_key
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment")
 

@@ -50,6 +50,7 @@
   }
 
   async function run() {
+    const t0 = performance.now();
     loading = true; errorMsg = ''; segmentResults = []; documentResults = [];
     try {
       let url: string;
@@ -75,14 +76,17 @@
       } else {
         documentResults = await res.json();
       }
+      console.log(`[search] mode=${mode} query="${q}" fetched in ${Math.round(performance.now() - t0)}ms`);
     } catch (e) {
       errorMsg = e instanceof Error ? e.message : 'Unknown error';
+      console.log(`[search] mode=${mode} query="${q}" failed after ${Math.round(performance.now() - t0)}ms`, e);
     } finally {
       loading = false;
     }
   }
 
   async function explain() {
+    const t0 = performance.now();
     if (!q.trim()) {
       planError = 'Enter a query first.';
       return;
@@ -106,8 +110,10 @@
       const json = await res.json();
       if (!json.ok) throw new Error(json.error || 'Explain failed');
       plan = json;
+      console.log(`[search-plan] mode=${mode} query="${q}" fetched in ${Math.round(performance.now() - t0)}ms`);
     } catch (e) {
       planError = e instanceof Error ? e.message : 'Unknown error';
+      console.log(`[search-plan] mode=${mode} query="${q}" failed after ${Math.round(performance.now() - t0)}ms`, e);
     } finally {
       planLoading = false;
     }
@@ -135,6 +141,12 @@
       .replace(/^#+\s?/gm, '')
       .replace(/-{3,}/g, '—')
       .trim();
+  }
+
+  function markDocumentNavigation() {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.setItem('docNavStart', String(Date.now()));
+    }
   }
 </script>
 
@@ -229,7 +241,7 @@
         >
           <div class="flex items-start justify-between gap-3">
             <div class="text-sm text-slate-600">
-              <a class="font-semibold text-slate-900 hover:text-sky-600" href={`/?document=${r.document_id}&segment=${r.segment_id}`}>
+              <a class="font-semibold text-slate-900 hover:text-sky-600" href={`/?document=${r.document_id}&segment=${r.segment_id}`} onclick={markDocumentNavigation}>
                 {r.document_title}
               </a>
               <span class="ml-2 uppercase badge badge-outline">{r.source_system}</span>
@@ -258,7 +270,7 @@
         <li class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-sky-300">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div class="text-sm text-slate-600 space-y-1">
-              <a class="font-semibold text-slate-900 hover:text-sky-600" href={`/?document=${doc.document_id}`}>
+              <a class="font-semibold text-slate-900 hover:text-sky-600" href={`/?document=${doc.document_id}`} onclick={markDocumentNavigation}>
                 {doc.document_title}
               </a>
               <div class="space-x-2 text-xs text-slate-500">
@@ -297,7 +309,7 @@
                   </div>
                   <div class="flex flex-wrap gap-2 text-xs text-slate-500">
                     <button class="btn btn-xs btn-outline" onclick={() => downloadSegment(segment.segment_id, doc.document_title)}>Export segment</button>
-                    <a class="link link-hover" href={`/?document=${doc.document_id}&segment=${segment.segment_id}`}>Open in viewer</a>
+                    <a class="link link-hover" href={`/?document=${doc.document_id}&segment=${segment.segment_id}`} onclick={markDocumentNavigation}>Open in viewer</a>
                   </div>
                 </div>
                 {/if}

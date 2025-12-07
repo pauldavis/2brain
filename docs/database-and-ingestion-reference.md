@@ -69,6 +69,11 @@ WHERE COALESCE(NULLIF(content_markdown, ''), '') = '';
 
 You can optionally wire these into app startup behind an env flag (e.g., `QA_CHECKS_ON_STARTUP=true`) and log warnings when violations are found.
 
+## API helper views
+
+- `db/api_search_hybrid_documents.sql` creates `api.search_hybrid_documents_json(...)`, a helper that returns the hybrid search response as JSON directly from Postgres. Run this SQL after migrations (e.g., `psql -f db/api_search_hybrid_documents.sql`). The FastAPI hybrid endpoint now depends on this function being present.
+- `db/api_document_view.sql` creates `api.document_view_json(uuid)`, which emits the entire `DocumentView` payload (document, version, segments, keywords) as JSON. The `/documents/{id}` API now calls this function directly.
+
 ## Ordering and timestamps in the viewer
 
 - Segment numbers shown in the UI come from `document_segments.sequence`.

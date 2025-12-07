@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import attachments, documents, search, stats
+from app.auth import get_current_user
+from app.routes import admin, attachments, documents, ingest, search, stats
 
 app = FastAPI(
     title="2brain Document Service",
@@ -18,7 +19,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(documents.router)
-app.include_router(attachments.router)
-app.include_router(search.router)
-app.include_router(stats.router)
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+app.include_router(documents.router, dependencies=[Depends(get_current_user)])
+app.include_router(attachments.router, dependencies=[Depends(get_current_user)])
+app.include_router(search.router, dependencies=[Depends(get_current_user)])
+app.include_router(stats.router, dependencies=[Depends(get_current_user)])
+app.include_router(ingest.router, dependencies=[Depends(get_current_user)])
+app.include_router(admin.router, dependencies=[Depends(get_current_user)])
