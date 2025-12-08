@@ -53,6 +53,9 @@ class Settings:
         users_raw = os.environ.get("ALLOWED_USERS", "")
         self.allowed_users = [u.strip() for u in users_raw.split(",") if u.strip()]
 
+        origins_raw = os.environ.get("CORS_ORIGINS", "*")
+        self.cors_origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+
         probes = os.environ.get("IVFFLAT_PROBES", "").strip()
         if probes:
             try:
