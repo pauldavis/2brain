@@ -5,6 +5,12 @@ const RAW_API_BASE = env.API_URL ?? "http://localhost:8100";
 const API_BASE = RAW_API_BASE.endsWith("/")
   ? RAW_API_BASE.slice(0, -1)
   : RAW_API_BASE;
+
+const RAW_PUBLIC_API_BASE = env.PUBLIC_API_BASE ?? "http://localhost:8100";
+const PUBLIC_API_BASE = RAW_PUBLIC_API_BASE.endsWith("/")
+  ? RAW_PUBLIC_API_BASE.slice(0, -1)
+  : RAW_PUBLIC_API_BASE;
+
 const DEFAULT_LIMIT = 50;
 
 export const load = (async ({ fetch, url }) => {
@@ -21,7 +27,7 @@ export const load = (async ({ fetch, url }) => {
       const text = await documentsRes.text();
       console.error("[load] Response body:", text);
       return {
-        apiBase: API_BASE,
+        apiBase: PUBLIC_API_BASE,
         documents: [],
         initialDocument: null,
         initialSegmentId: null,
@@ -32,7 +38,7 @@ export const load = (async ({ fetch, url }) => {
   } catch (e) {
     console.error("[load] Network/Fetch error:", e);
     return {
-      apiBase: API_BASE,
+      apiBase: PUBLIC_API_BASE,
       documents: [],
       initialDocument: null,
       initialSegmentId: null,
@@ -91,7 +97,7 @@ export const load = (async ({ fetch, url }) => {
   }
 
   return {
-    apiBase: API_BASE,
+    apiBase: PUBLIC_API_BASE,
     documents,
     initialDocument,
     initialSegmentId,
