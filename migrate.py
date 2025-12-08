@@ -133,9 +133,7 @@ def main():
 
     try:
         with get_connection() as conn:
-            logger.info(
-                f"Connected to database: {conn.info.dsn_parameters.get('dbname')}"
-            )
+            logger.info(f"Connected to database: {conn.info.dbname}")
 
             # 1. Apply Versioned Migrations
             if migrations_dir.exists():

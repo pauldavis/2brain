@@ -30,14 +30,14 @@ WITH settings AS (
 ),
 bm AS (
   SELECT segment_id,
-         ROW_NUMBER() OVER (ORDER BY score) AS r
+         ROW_NUMBER() OVER (ORDER BY score DESC) AS r
   FROM (
     SELECT ds.id AS segment_id,
-           ds.content_markdown <@> to_bm25query(p_query, 'document_segments_bm25_idx') AS score
+           ts_rank(ds.content_plaintext, websearch_to_tsquery('english', p_query)) AS score
     FROM public.document_segments ds
     WHERE ds.embedding_status = 'ready'
       AND ds.is_noise = FALSE
-    ORDER BY score
+    ORDER BY score DESC
     LIMIT p_k
   ) ranked
 ),

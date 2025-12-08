@@ -28,7 +28,7 @@ query_cte AS (
         normalized_query,
         CASE
             WHEN normalized_query IS NULL THEN NULL
-            ELSE plainto_tsquery('english', normalized_query)
+            ELSE websearch_to_tsquery('english', normalized_query)
         END AS ts_query
     FROM params
 )
@@ -85,7 +85,7 @@ WITH ranked AS (
         ds.sequence,
         ds.source_role,
         LEFT(ds.content_markdown, 280) AS snippet,
-        ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx') AS score,
+        ts_rank(ds.content_plaintext, websearch_to_tsquery('english', %(q)s::text)) AS score,
         stats.segment_count,
         stats.char_count
     FROM documents d
@@ -118,22 +118,22 @@ SELECT
     snippet,
     score
 FROM ranked
-WHERE score < COALESCE(%(threshold)s::float8, 1e9)
-ORDER BY score
+WHERE score > COALESCE(%(threshold)s::float8, 0.0)
+ORDER BY score DESC
 LIMIT %(limit)s OFFSET %(offset)s;
 """
 
 RRF_SQL = """
 WITH bm AS (
   SELECT segment_id,
-         ROW_NUMBER() OVER (ORDER BY score) AS r
+         ROW_NUMBER() OVER (ORDER BY score DESC) AS r
   FROM (
     SELECT ds.id AS segment_id,
-           ds.content_markdown <@> to_bm25query(%(q)s::text, 'document_segments_bm25_idx') AS score
+           ts_rank(ds.content_plaintext, websearch_to_tsquery('english', %(q)s::text)) AS score
     FROM public.document_segments ds
     WHERE ds.embedding_status = 'ready'
       AND ds.is_noise = FALSE
-    ORDER BY score
+    ORDER BY score DESC
     LIMIT %(k)s
   ) ranked
 ),
