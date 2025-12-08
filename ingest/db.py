@@ -17,6 +17,7 @@ class PersistResult:
     document_created: bool
     version_created: bool
 
+
 QUALITY_NOISE_THRESHOLD = 0.2
 
 
@@ -70,10 +71,7 @@ def estimate_segment_quality(markdown: str, plaintext: str) -> tuple[float, bool
     score = max(0.0, min(1.0, score))
 
     is_noise = (
-        score < 0.2
-        or token_count < 3
-        or unique_tokens <= 1
-        or alpha_ratio < 0.25
+        score < 0.2 or token_count < 3 or unique_tokens <= 1 or alpha_ratio < 0.25
     )
     return score, is_noise
 
@@ -131,8 +129,12 @@ def persist_document(
         document_row = cur.fetchone()
         if document_row is None:
             raise RuntimeError("Failed to insert or update document record.")
-        document_id = document_row[0]
-        document_created = bool(document_row[1])
+        if isinstance(document_row, dict):
+            document_id = document_row["id"]
+            document_created = bool(document_row["inserted"])
+        else:
+            document_id = document_row[0]
+            document_created = bool(document_row[1])
 
         cur.execute(
             """
@@ -168,7 +170,9 @@ def persist_document(
                 document_created=document_created,
                 version_created=False,
             )
-        document_version_id = version_row[0]
+        document_version_id = (
+            version_row["id"] if isinstance(version_row, dict) else version_row[0]
+        )
 
         node_to_segment_id: dict[str, str] = {}
         for segment in segments:
@@ -230,7 +234,9 @@ def persist_document(
                     segment.content_markdown,
                     segment.content_checksum,
                     segment.plaintext,
-                    Json(segment.content_json) if segment.content_json is not None else None,
+                    Json(segment.content_json)
+                    if segment.content_json is not None
+                    else None,
                     quality_score,
                     is_noise,
                     embedding_status_override if is_noise else None,
@@ -242,7 +248,9 @@ def persist_document(
             segment_row = cur.fetchone()
             if segment_row is None:
                 raise RuntimeError("Failed to insert segment record.")
-            segment_id = segment_row[0]
+            segment_id = (
+                segment_row["id"] if isinstance(segment_row, dict) else segment_row[0]
+            )
             node_to_segment_id[segment.node_id] = segment_id
 
             for index, block in enumerate(segment.blocks, start=1):
@@ -299,7 +307,11 @@ def persist_document(
                 attachment_row = cur.fetchone()
                 if attachment_row is None:
                     raise RuntimeError("Failed to create attachment record.")
-                attachment_id = attachment_row[0]
+                attachment_id = (
+                    attachment_row["id"]
+                    if isinstance(attachment_row, dict)
+                    else attachment_row[0]
+                )
 
                 cur.execute(
                     """

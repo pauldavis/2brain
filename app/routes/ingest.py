@@ -74,7 +74,7 @@ def _detect_and_ingest(
                     # Commit per conversation to match CLI behavior
                     conn.commit()
                 except Exception as e:
-                    logger.error(f"Failed to ingest conversation {i}: {e}")
+                    logger.exception(f"Failed to ingest conversation {i}: {e}")
                     conn.rollback()
 
         logger.info("Ingestion complete")
