@@ -1,12 +1,14 @@
 import type { PageServerLoad } from "./$types";
 import { env } from "$env/dynamic/private";
+import { env as publicEnv } from "$env/dynamic/public";
 import type { DocumentSummary, DocumentView } from "$lib/types";
 const RAW_API_BASE = env.API_URL ?? "http://localhost:8100";
 const API_BASE = RAW_API_BASE.endsWith("/")
   ? RAW_API_BASE.slice(0, -1)
   : RAW_API_BASE;
 
-const RAW_PUBLIC_API_BASE = env.PUBLIC_API_BASE ?? "http://localhost:8100";
+const RAW_PUBLIC_API_BASE =
+  publicEnv.PUBLIC_API_BASE ?? env.PUBLIC_API_BASE ?? "http://localhost:8100";
 const PUBLIC_API_BASE = RAW_PUBLIC_API_BASE.endsWith("/")
   ? RAW_PUBLIC_API_BASE.slice(0, -1)
   : RAW_PUBLIC_API_BASE;
