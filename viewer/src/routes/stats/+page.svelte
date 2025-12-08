@@ -33,11 +33,10 @@
         try {
             const [vectorizer, bm25, coverage, table, queries] =
                 await Promise.all([
-                    const [vectorizer, bm25, coverage, table, queries] = await Promise.all([
-                      fetchJSON('stats/vectorizer'),
-                      fetchJSON('stats/fts'),
-                      fetchJSON('stats/coverage'),
-                      fetchJSON('stats/table'),
+                    fetchJSON("stats/vectorizer"),
+                    fetchJSON("stats/fts"),
+                    fetchJSON("stats/coverage"),
+                    fetchJSON("stats/table"),
                     fetchJSON("stats/queries"),
                 ]);
             const t = new Date().toISOString();
