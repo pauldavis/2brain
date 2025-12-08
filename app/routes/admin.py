@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.auth import get_current_user
-from app.db import get_connection
+from app.db import connection
 from app.services.vectorizer import backfill_loop
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,8 @@ def refresh_indices(user=Depends(get_current_user)):
 
         # 2. Database Maintenance
         # We need a connection that can run VACUUM (cannot run inside a transaction block)
-        # get_connection yields a connection that we can configure.
-        with get_connection() as conn:
+        # connection() yields a connection that we can configure.
+        with connection() as conn:
             old_autocommit = conn.autocommit
             conn.autocommit = True
             try:

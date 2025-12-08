@@ -12,7 +12,7 @@ from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 
 from app.auth import get_current_user
-from app.db import get_connection
+from app.db import connection
 from app.services.vectorizer import backfill_loop
 
 # Assuming these are available in the pythonpath
@@ -63,7 +63,7 @@ def _detect_and_ingest(
         logger.info(f"Ingesting {len(data)} conversations as {detected_type}")
 
         # Ingest
-        with get_connection() as conn:
+        with connection() as conn:
             for i, conv in enumerate(data):
                 try:
                     if detected_type == "claude":

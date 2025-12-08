@@ -7,7 +7,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.config import get_settings
-from app.db import get_connection
+from app.db import connection
 from app.services.search import embed_query_openai
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ def process_pending_embeddings(batch_size: int = 50) -> int:
 
     try:
         # We use a separate connection context to ensure we can commit/rollback independently
-        with get_connection() as conn:
+        with connection() as conn:
             # 1. Fetch pending segments
             with conn.cursor() as cur:
                 cur.execute(
