@@ -6,8 +6,12 @@ from fastapi import APIRouter, Depends, Query
 
 from app.db import get_connection
 from app.metrics import get_query_stats
-from app.services.search import BM25_SQL, RRF_SQL, _format_vector_literal, embed_query_openai
-
+from app.services.search import (
+    BM25_SQL,
+    RRF_SQL,
+    _format_vector_literal,
+    embed_query_openai,
+)
 
 router = APIRouter(tags=["stats"])
 
@@ -16,16 +20,22 @@ router = APIRouter(tags=["stats"])
 def stats_vectorizer(conn=Depends(get_connection)) -> Dict[str, Any]:
     data: Dict[str, Any] = {"ok": True, "vectorizers": []}
     try:
-        view_exists = conn.execute("SELECT to_regclass('ai.vectorizer_status')").fetchone()[0]
+        view_exists = conn.execute(
+            "SELECT to_regclass('ai.vectorizer_status')"
+        ).fetchone()[0]
         if view_exists is None:
-            data["message"] = "pgai vectorizer metadata is not installed (missing ai.vectorizer_status)."
+            data["message"] = (
+                "pgai vectorizer metadata is not installed (missing ai.vectorizer_status)."
+            )
             return data
 
         vs = conn.execute("SELECT * FROM ai.vectorizer_status").fetchall()
         rows = [dict(r) for r in vs]
         data["vectorizers"] = rows
         if not rows:
-            data["message"] = "No vectorizers registered. Run ai.create_vectorizer first."
+            data["message"] = (
+                "No vectorizers registered. Run ai.create_vectorizer first."
+            )
             return data
 
         name = rows[0]["name"]
@@ -59,16 +69,18 @@ def stats_vectorizer(conn=Depends(get_connection)) -> Dict[str, Any]:
     return data
 
 
-@router.get("/stats/bm25")
-def stats_bm25(conn=Depends(get_connection)) -> Dict[str, Any]:
+@router.get("/stats/fts")
+def stats_fts(conn=Depends(get_connection)) -> Dict[str, Any]:
     data: Dict[str, Any] = {"ok": True}
     try:
         idx_row = conn.execute(
-            "SELECT to_regclass('public.document_segments_bm25_idx') AS idx_oid"
+            "SELECT to_regclass('public.document_segments_content_plaintext_idx') AS idx_oid"
         ).fetchone()
         idx_oid = idx_row["idx_oid"] if idx_row else None
         if idx_oid is None:
-            data["message"] = "BM25 index document_segments_bm25_idx is missing. Run db/bm25_document_segments.sql."
+            data["message"] = (
+                "GIN index document_segments_content_plaintext_idx is missing. Run migration 0001_initial_schema.sql."
+            )
             data["usage"] = None
             data["size"] = None
             data["table_stats"] = None
@@ -78,13 +90,13 @@ def stats_bm25(conn=Depends(get_connection)) -> Dict[str, Any]:
             """
             SELECT *
             FROM pg_stat_user_indexes
-            WHERE indexrelname = 'document_segments_bm25_idx'
+            WHERE indexrelname = 'document_segments_content_plaintext_idx'
             """
         ).fetchone()
         data["usage"] = dict(idx) if idx else None
         size_row = conn.execute(
             """
-            SELECT pg_size_pretty(pg_relation_size('public.document_segments_bm25_idx')) AS size
+            SELECT pg_size_pretty(pg_relation_size('public.document_segments_content_plaintext_idx')) AS size
             """
         ).fetchone()
         data["size"] = size_row["size"] if size_row else None
@@ -105,7 +117,9 @@ def stats_bm25(conn=Depends(get_connection)) -> Dict[str, Any]:
     return data
 
 
-def _explain_query(conn, sql: str, params: Dict[str, Any], *, analyze: bool = True) -> Dict[str, Any]:
+def _explain_query(
+    conn, sql: str, params: Dict[str, Any], *, analyze: bool = True
+) -> Dict[str, Any]:
     """Run EXPLAIN (FORMAT JSON) against the provided SQL and return the parsed plan."""
     explain_opts = ["BUFFERS", "VERBOSE", "COSTS", "FORMAT JSON"]
     if analyze:
@@ -125,7 +139,9 @@ def stats_search_plan(
     q: str = Query(..., description="Search text to analyze"),
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    threshold: float | None = Query(None, description="BM25 score cutoff when mode=bm25"),
+    threshold: float | None = Query(
+        None, description="BM25 score cutoff when mode=bm25"
+    ),
     w_bm25: float = Query(0.5, ge=0.0, le=1.0),
     w_vec: float = Query(0.5, ge=0.0, le=1.0),
     k: int = Query(60, ge=1, le=500),
@@ -214,7 +230,9 @@ def stats_table(conn=Depends(get_connection)) -> Dict[str, Any]:
         ).fetchone()
         size = size_row["size"] if size_row else None
         count = count_row["count"] if count_row else None
-        data.update({"table_size": size, "rows": int(count) if count is not None else None})
+        data.update(
+            {"table_size": size, "rows": int(count) if count is not None else None}
+        )
     except Exception as e:  # pragma: no cover
         data = {
             "ok": False,
