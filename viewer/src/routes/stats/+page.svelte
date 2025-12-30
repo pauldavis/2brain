@@ -9,7 +9,7 @@
     type Snapshot = {
         t: string;
         vectorizer?: any;
-        bm25?: any;
+        fts?: any;
         coverage?: any;
         table?: any;
     };
@@ -31,7 +31,7 @@
 
     async function pollOnce() {
         try {
-            const [vectorizer, bm25, coverage, table, queries] =
+            const [vectorizer, fts, coverage, table, queries] =
                 await Promise.all([
                     fetchJSON("stats/vectorizer"),
                     fetchJSON("stats/fts"),
@@ -41,7 +41,7 @@
                 ]);
             const t = new Date().toISOString();
             snapshots = [
-                { t, vectorizer, bm25, coverage, table, queries },
+                { t, vectorizer, fts, coverage, table, queries },
                 ...snapshots,
             ].slice(0, 200);
         } catch (e) {
@@ -94,9 +94,9 @@
                 <div
                     class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
                 >
-                    <h2 class="text-lg font-semibold">BM25</h2>
+                    <h2 class="text-lg font-semibold">FTS</h2>
                     <pre class="text-xs overflow-auto">{JSON.stringify(
-                            snapshots[0].bm25,
+                            snapshots[0].fts,
                             null,
                             2,
                         )}</pre>
@@ -141,7 +141,7 @@
                                         {
                                             pending_exact:
                                                 s.vectorizer?.pending_exact,
-                                            usage: s.bm25?.usage,
+                                            usage: s.fts?.usage,
                                         },
                                         null,
                                         2,

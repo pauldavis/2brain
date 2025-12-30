@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import quote_plus
 
 try:
@@ -15,7 +16,11 @@ class Settings:
 
     def __init__(self) -> None:
         if load_dotenv:
-            load_dotenv()
+            # Always load the repo-root .env regardless of current working directory.
+            # This file lives at: <repo_root>/app/config.py -> repo root is parent of app/.
+            repo_root = Path(__file__).resolve().parents[1]
+            dotenv_path = repo_root / ".env"
+            load_dotenv(dotenv_path=dotenv_path)
 
         database_url = os.environ.get("DATABASE_URL")
         if not database_url:

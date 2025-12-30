@@ -1,0 +1,1024 @@
+## User
+
+[@Directory Listing 2brain Project Files](zed:///agent/thread/4f26e90f-7224-454e-a6bd-86e5f1380988?name=Directory+Listing+2brain+Project+Files)
+`Image` 
+
+I have been experimenting with the tool and i still find search perforemacne to be quite slow. What are some methods to improve performance?
+
+## Assistant
+
+Search slowness in **2brain** usually comes from a mix of (a) slow PostgreSQL text ranking, (b) expensive joins/filters (especially `embedding_status`), (c) missing/ineffective indexes, and (d) returning too much data per query. Here are the highest‑leverage methods, in roughly the order I’d try them.
+
+## 1) Make sure your FTS/BM25 path is actually index-backed
+If you’re using Postgres full-text search (FTS), you want:
+
+- a **stored `tsvector` column** (or generated column) for the segment text
+- a **GIN index** on that `tsvector`
+- a query that uses `@@` against the `tsvector` (not building vectors on the fly)
+
+If your query does `to_tsvector(...)` inside the `WHERE`, Postgres often can’t use the index efficiently.
+
+**Check** with `EXPLAIN (ANALYZE, BUFFERS)` on your slow search query and verify you see a `Bitmap Index Scan` (GIN) rather than a sequential scan.
+
+## 2) Reduce ranking cost: “filter first, rank later”
+`ts_rank` over a large candidate set is expensive. Pattern to speed up:
+
+1. Use `@@` to get candidate rows quickly (index-backed)
+2. Add selective filters early (workspace/user, time, document_id, etc.)
+3. Only then compute rank and sort on a smaller set
+
+A common trick is a 2-stage query: first fetch candidate IDs (limit ~2000), then compute ranks + joins + full projection only for those.
+
+## 3) Add the *right* supporting indexes for your filters
+Even if FTS is indexed, your extra filters can force heavy work if they aren’t indexed well. Typical ones in this app:
+
+- `document_segments(document_id)` (btree)
+- `document_segments(conversation_id)` / `source_id` etc. (btree)
+- `document_segments(embedding_status)` (btree) if you filter on it a lot
+- Composite indexes that match your most common filter patterns, e.g.  
+  `(workspace_id, document_id)` or `(workspace_id, embedding_status)` depending on your schema.
+
+Also make sure your join keys are indexed on both sides (e.g. `documents(id)` obviously, but also FK columns).
+
+## 4) Don’t block keyword search on embeddings
+From your context: segments with `embedding_status='pending'` are excluded from search. That can accidentally make Postgres do more work (and it hurts UX).
+
+Best practice:
+- For **keyword/FTS search**, include pending segments (text is available immediately).
+- For **vector/hybrid search**, require `embedding_status='ready'`.
+
+This not only improves UX, it often simplifies the FTS query and makes it more selective in the right way.
+
+## 5) Return less data (projection + pagination)
+Search endpoints often become slow because they:
+- return full segment text + metadata + big JSON blobs
+- do heavy joins before limiting
+
+Return only what the results list needs:
+- `segment_id`, `document_id`, `score`, maybe a short snippet
+- fetch full content only when the user opens a result
+
+Also ensure you have strict `LIMIT/OFFSET` (or keyset pagination) applied *before* big joins when possible.
+
+## 6) Tune Postgres and keep stats fresh
+Even perfect indexes can underperform if:
+- autovacuum/analyze is behind
+- work_mem is too low for sorts
+- random_page_cost is too high for SSD environments
+
+What helps most in practice:
+- Run `ANALYZE` after large ingests (or ensure autovacuum/analyze is keeping up)
+- Increase `work_mem` modestly for the search role/session if sorts spill to disk
+- Watch for “Sort Method: external merge Disk:” in `EXPLAIN ANALYZE`
+
+## 7) If you do hybrid search, do it in two phases
+Vector search + FTS + ranking in one SQL query can be expensive.
+
+Faster approach:
+- Run vector search to get top K segment IDs (e.g. 200–1000)
+- Run FTS/ranking (or just metadata fetch + rerank in Python) against that smaller set
+- Or do the reverse: FTS first for recall, then vector rerank
+
+## 8) Cache the hot path
+Even a simple cache can massively reduce perceived latency:
+- Cache query → result IDs for a short TTL (10–60s) per user/workspace
+- Cache document metadata and segment snippets
+- If you have “typeahead” search, debounce on the client and cache server-side by normalized query string
+
+---
+
+### The fastest way to get you to “what’s actually slow”
+If you paste the **exact slow query** (or tell me which endpoint, like `GET /search`), I can tell you precisely what to index / rewrite. Even better: run `EXPLAIN (ANALYZE, BUFFERS)` for one slow query and share the output—then I’ll point at the line that’s dominating runtime and propose a targeted fix.
+
+## User
+
+heres a plan fro a hybrid query, seraching at https://2brain.up.railway.app/search for the string "tropical"
+{
+  "ok": true,
+  "query": "tropical",
+  "metadata": {
+    "mode": "hybrid",
+    "w_bm25": 0.5,
+    "w_vec": 0.5,
+    "k": 60,
+    "limit": 20,
+    "offset": 0
+  },
+  "planning_time_ms": null,
+  "execution_time_ms": null,
+  "plan": {
+    "Plan": {
+      "Node Type": "Limit",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 14770.38,
+      "Total Cost": 14770.43,
+      "Plan Rows": 20,
+      "Plan Width": 140,
+      "Disabled": false,
+      "Output": [
+        "d.id",
+        "d.title",
+        "d.source_system",
+        "d.updated_at",
+        "ds.id",
+        "ds.sequence",
+        "ds.source_role",
+        "(\"left\"(ds.content_markdown, 280))",
+        "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))))",
+        "(count(*))",
+        "(COALESCE(sum(NULLIF(length(ds_all.content_markdown), 0)), '0'::bigint))"
+      ],
+      "Shared Hit Blocks": 0,
+      "Shared Read Blocks": 0,
+      "Shared Dirtied Blocks": 0,
+      "Shared Written Blocks": 0,
+      "Local Hit Blocks": 0,
+      "Local Read Blocks": 0,
+      "Local Dirtied Blocks": 0,
+      "Local Written Blocks": 0,
+      "Temp Read Blocks": 0,
+      "Temp Written Blocks": 0,
+      "Plans": [
+        {
+          "Node Type": "Sort",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 14770.38,
+          "Total Cost": 14770.46,
+          "Plan Rows": 32,
+          "Plan Width": 140,
+          "Disabled": false,
+          "Output": [
+            "d.id",
+            "d.title",
+            "d.source_system",
+            "d.updated_at",
+            "ds.id",
+            "ds.sequence",
+            "ds.source_role",
+            "(\"left\"(ds.content_markdown, 280))",
+            "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))))",
+            "(count(*))",
+            "(COALESCE(sum(NULLIF(length(ds_all.content_markdown), 0)), '0'::bigint))"
+          ],
+          "Sort Key": [
+            "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision)))) DESC"
+          ],
+          "Shared Hit Blocks": 0,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 11783.65,
+              "Total Cost": 14769.58,
+              "Plan Rows": 32,
+              "Plan Width": 140,
+              "Disabled": false,
+              "Output": [
+                "d.id",
+                "d.title",
+                "d.source_system",
+                "d.updated_at",
+                "ds.id",
+                "ds.sequence",
+                "ds.source_role",
+                "\"left\"(ds.content_markdown, 280)",
+                "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))))",
+                "(count(*))",
+                "(COALESCE(sum(NULLIF(length(ds_all.content_markdown), 0)), '0'::bigint))"
+              ],
+              "Inner Unique": false,
+              "Shared Hit Blocks": 0,
+              "Shared Read Blocks": 0,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0,
+              "Plans": [
+                {
+                  "Node Type": "Nested Loop",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Join Type": "Inner",
+                  "Startup Cost": 11717.6,
+                  "Total Cost": 12655.2,
+                  "Plan Rows": 32,
+                  "Plan Width": 327,
+                  "Disabled": false,
+                  "Output": [
+                    "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))))",
+                    "ds.id",
+                    "ds.sequence",
+                    "ds.source_role",
+                    "ds.content_markdown",
+                    "dv.id",
+                    "d.id",
+                    "d.title",
+                    "d.source_system",
+                    "d.updated_at"
+                  ],
+                  "Inner Unique": true,
+                  "Shared Hit Blocks": 0,
+                  "Shared Read Blocks": 0,
+                  "Shared Dirtied Blocks": 0,
+                  "Shared Written Blocks": 0,
+                  "Local Hit Blocks": 0,
+                  "Local Read Blocks": 0,
+                  "Local Dirtied Blocks": 0,
+                  "Local Written Blocks": 0,
+                  "Temp Read Blocks": 0,
+                  "Temp Written Blocks": 0,
+                  "Plans": [
+                    {
+                      "Node Type": "Nested Loop",
+                      "Parent Relationship": "Outer",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Join Type": "Inner",
+                      "Startup Cost": 11717.32,
+                      "Total Cost": 12636.56,
+                      "Plan Rows": 32,
+                      "Plan Width": 283,
+                      "Disabled": false,
+                      "Output": [
+                        "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))))",
+                        "ds.id",
+                        "ds.sequence",
+                        "ds.source_role",
+                        "ds.content_markdown",
+                        "dv.id",
+                        "dv.document_id"
+                      ],
+                      "Inner Unique": true,
+                      "Shared Hit Blocks": 0,
+                      "Shared Read Blocks": 0,
+                      "Shared Dirtied Blocks": 0,
+                      "Shared Written Blocks": 0,
+                      "Local Hit Blocks": 0,
+                      "Local Read Blocks": 0,
+                      "Local Dirtied Blocks": 0,
+                      "Local Written Blocks": 0,
+                      "Temp Read Blocks": 0,
+                      "Temp Written Blocks": 0,
+                      "Plans": [
+                        {
+                          "Node Type": "Nested Loop",
+                          "Parent Relationship": "Outer",
+                          "Parallel Aware": false,
+                          "Async Capable": false,
+                          "Join Type": "Inner",
+                          "Startup Cost": 11717.04,
+                          "Total Cost": 12625.25,
+                          "Plan Rows": 32,
+                          "Plan Width": 267,
+                          "Disabled": false,
+                          "Output": [
+                            "(sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))))",
+                            "ds.id",
+                            "ds.sequence",
+                            "ds.source_role",
+                            "ds.content_markdown",
+                            "ds.document_version_id"
+                          ],
+                          "Inner Unique": true,
+                          "Shared Hit Blocks": 0,
+                          "Shared Read Blocks": 0,
+                          "Shared Dirtied Blocks": 0,
+                          "Shared Written Blocks": 0,
+                          "Local Hit Blocks": 0,
+                          "Local Read Blocks": 0,
+                          "Local Dirtied Blocks": 0,
+                          "Local Written Blocks": 0,
+                          "Temp Read Blocks": 0,
+                          "Temp Written Blocks": 0,
+                          "Plans": [
+                            {
+                              "Node Type": "Aggregate",
+                              "Strategy": "Sorted",
+                              "Partial Mode": "Simple",
+                              "Parent Relationship": "Outer",
+                              "Parallel Aware": false,
+                              "Async Capable": false,
+                              "Startup Cost": 11716.75,
+                              "Total Cost": 11718.85,
+                              "Plan Rows": 120,
+                              "Plan Width": 24,
+                              "Disabled": false,
+                              "Output": [
+                                "b.segment_id",
+                                "sum((('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision)))"
+                              ],
+                              "Group Key": [
+                                "b.segment_id"
+                              ],
+                              "Shared Hit Blocks": 0,
+                              "Shared Read Blocks": 0,
+                              "Shared Dirtied Blocks": 0,
+                              "Shared Written Blocks": 0,
+                              "Local Hit Blocks": 0,
+                              "Local Read Blocks": 0,
+                              "Local Dirtied Blocks": 0,
+                              "Local Written Blocks": 0,
+                              "Temp Read Blocks": 0,
+                              "Temp Written Blocks": 0,
+                              "Plans": [
+                                {
+                                  "Node Type": "Sort",
+                                  "Parent Relationship": "Outer",
+                                  "Parallel Aware": false,
+                                  "Async Capable": false,
+                                  "Startup Cost": 11716.75,
+                                  "Total Cost": 11717.05,
+                                  "Plan Rows": 120,
+                                  "Plan Width": 24,
+                                  "Disabled": false,
+                                  "Output": [
+                                    "b.segment_id",
+                                    "(('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision))"
+                                  ],
+                                  "Sort Key": [
+                                    "b.segment_id"
+                                  ],
+                                  "Shared Hit Blocks": 0,
+                                  "Shared Read Blocks": 0,
+                                  "Shared Dirtied Blocks": 0,
+                                  "Shared Written Blocks": 0,
+                                  "Local Hit Blocks": 0,
+                                  "Local Read Blocks": 0,
+                                  "Local Dirtied Blocks": 0,
+                                  "Local Written Blocks": 0,
+                                  "Temp Read Blocks": 0,
+                                  "Temp Written Blocks": 0,
+                                  "Plans": [
+                                    {
+                                      "Node Type": "Append",
+                                      "Parent Relationship": "Outer",
+                                      "Parallel Aware": false,
+                                      "Async Capable": false,
+                                      "Startup Cost": 5957.67,
+                                      "Total Cost": 11712.61,
+                                      "Plan Rows": 120,
+                                      "Plan Width": 24,
+                                      "Disabled": false,
+                                      "Shared Hit Blocks": 0,
+                                      "Shared Read Blocks": 0,
+                                      "Shared Dirtied Blocks": 0,
+                                      "Shared Written Blocks": 0,
+                                      "Local Hit Blocks": 0,
+                                      "Local Read Blocks": 0,
+                                      "Local Dirtied Blocks": 0,
+                                      "Local Written Blocks": 0,
+                                      "Temp Read Blocks": 0,
+                                      "Temp Written Blocks": 0,
+                                      "Subplans Removed": 0,
+                                      "Plans": [
+                                        {
+                                          "Node Type": "Subquery Scan",
+                                          "Parent Relationship": "Member",
+                                          "Parallel Aware": false,
+                                          "Async Capable": false,
+                                          "Alias": "b",
+                                          "Startup Cost": 5957.67,
+                                          "Total Cost": 5960.05,
+                                          "Plan Rows": 60,
+                                          "Plan Width": 24,
+                                          "Disabled": false,
+                                          "Output": [
+                                            "b.segment_id",
+                                            "('0.5'::double precision * ((1.0 / (('60'::smallint + b.r))::numeric))::double precision)"
+                                          ],
+                                          "Shared Hit Blocks": 0,
+                                          "Shared Read Blocks": 0,
+                                          "Shared Dirtied Blocks": 0,
+                                          "Shared Written Blocks": 0,
+                                          "Local Hit Blocks": 0,
+                                          "Local Read Blocks": 0,
+                                          "Local Dirtied Blocks": 0,
+                                          "Local Written Blocks": 0,
+                                          "Temp Read Blocks": 0,
+                                          "Temp Written Blocks": 0,
+                                          "Plans": [
+                                            {
+                                              "Node Type": "WindowAgg",
+                                              "Parent Relationship": "Subquery",
+                                              "Parallel Aware": false,
+                                              "Async Capable": false,
+                                              "Startup Cost": 5957.67,
+                                              "Total Cost": 5958.7,
+                                              "Plan Rows": 60,
+                                              "Plan Width": 28,
+                                              "Disabled": false,
+                                              "Output": [
+                                                "ranked.segment_id",
+                                                "row_number() OVER w1",
+                                                "ranked.score"
+                                              ],
+                                              "Window": "w1 AS (ORDER BY ranked.score ROWS UNBOUNDED PRECEDING)",
+                                              "Shared Hit Blocks": 0,
+                                              "Shared Read Blocks": 0,
+                                              "Shared Dirtied Blocks": 0,
+                                              "Shared Written Blocks": 0,
+                                              "Local Hit Blocks": 0,
+                                              "Local Read Blocks": 0,
+                                              "Local Dirtied Blocks": 0,
+                                              "Local Written Blocks": 0,
+                                              "Temp Read Blocks": 0,
+                                              "Temp Written Blocks": 0,
+                                              "Plans": [
+                                                {
+                                                  "Node Type": "Subquery Scan",
+                                                  "Parent Relationship": "Outer",
+                                                  "Parallel Aware": false,
+                                                  "Async Capable": false,
+                                                  "Alias": "ranked",
+                                                  "Startup Cost": 5957.65,
+                                                  "Total Cost": 5957.8,
+                                                  "Plan Rows": 60,
+                                                  "Plan Width": 20,
+                                                  "Disabled": false,
+                                                  "Output": [
+                                                    "ranked.score",
+                                                    "ranked.segment_id"
+                                                  ],
+                                                  "Shared Hit Blocks": 0,
+                                                  "Shared Read Blocks": 0,
+                                                  "Shared Dirtied Blocks": 0,
+                                                  "Shared Written Blocks": 0,
+                                                  "Local Hit Blocks": 0,
+                                                  "Local Read Blocks": 0,
+                                                  "Local Dirtied Blocks": 0,
+                                                  "Local Written Blocks": 0,
+                                                  "Temp Read Blocks": 0,
+                                                  "Temp Written Blocks": 0,
+                                                  "Plans": [
+                                                    {
+                                                      "Node Type": "Limit",
+                                                      "Parent Relationship": "Subquery",
+                                                      "Parallel Aware": false,
+                                                      "Async Capable": false,
+                                                      "Startup Cost": 5957.65,
+                                                      "Total Cost": 5957.8,
+                                                      "Plan Rows": 60,
+                                                      "Plan Width": 20,
+                                                      "Disabled": false,
+                                                      "Output": [
+                                                        "ds_1.id",
+                                                        "(ts_rank(ds_1.content_plaintext, '''tropic'''::tsquery))"
+                                                      ],
+                                                      "Shared Hit Blocks": 0,
+                                                      "Shared Read Blocks": 0,
+                                                      "Shared Dirtied Blocks": 0,
+                                                      "Shared Written Blocks": 0,
+                                                      "Local Hit Blocks": 0,
+                                                      "Local Read Blocks": 0,
+                                                      "Local Dirtied Blocks": 0,
+                                                      "Local Written Blocks": 0,
+                                                      "Temp Read Blocks": 0,
+                                                      "Temp Written Blocks": 0,
+                                                      "Plans": [
+                                                        {
+                                                          "Node Type": "Sort",
+                                                          "Parent Relationship": "Outer",
+                                                          "Parallel Aware": false,
+                                                          "Async Capable": false,
+                                                          "Startup Cost": 5957.65,
+                                                          "Total Cost": 5987.18,
+                                                          "Plan Rows": 11810,
+                                                          "Plan Width": 20,
+                                                          "Disabled": false,
+                                                          "Output": [
+                                                            "ds_1.id",
+                                                            "(ts_rank(ds_1.content_plaintext, '''tropic'''::tsquery))"
+                                                          ],
+                                                          "Sort Key": [
+                                                            "(ts_rank(ds_1.content_plaintext, '''tropic'''::tsquery)) DESC"
+                                                          ],
+                                                          "Shared Hit Blocks": 0,
+                                                          "Shared Read Blocks": 0,
+                                                          "Shared Dirtied Blocks": 0,
+                                                          "Shared Written Blocks": 0,
+                                                          "Local Hit Blocks": 0,
+                                                          "Local Read Blocks": 0,
+                                                          "Local Dirtied Blocks": 0,
+                                                          "Local Written Blocks": 0,
+                                                          "Temp Read Blocks": 0,
+                                                          "Temp Written Blocks": 0,
+                                                          "Plans": [
+                                                            {
+                                                              "Node Type": "Seq Scan",
+                                                              "Parent Relationship": "Outer",
+                                                              "Parallel Aware": false,
+                                                              "Async Capable": false,
+                                                              "Relation Name": "document_segments",
+                                                              "Schema": "public",
+                                                              "Alias": "ds_1",
+                                                              "Startup Cost": 0,
+                                                              "Total Cost": 5549.8,
+                                                              "Plan Rows": 11810,
+                                                              "Plan Width": 20,
+                                                              "Disabled": false,
+                                                              "Output": [
+                                                                "ds_1.id",
+                                                                "ts_rank(ds_1.content_plaintext, '''tropic'''::tsquery)"
+                                                              ],
+                                                              "Filter": "((NOT ds_1.is_noise) AND (ds_1.embedding_status = 'ready'::text))",
+                                                              "Shared Hit Blocks": 0,
+                                                              "Shared Read Blocks": 0,
+                                                              "Shared Dirtied Blocks": 0,
+                                                              "Shared Written Blocks": 0,
+                                                              "Local Hit Blocks": 0,
+                                                              "Local Read Blocks": 0,
+                                                              "Local Dirtied Blocks": 0,
+                                                              "Local Written Blocks": 0,
+                                                              "Temp Read Blocks": 0,
+                                                              "Temp Written Blocks": 0
+                                                            }
+                                                          ]
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        },
+                                        {
+                                          "Node Type": "Subquery Scan",
+                                          "Parent Relationship": "Member",
+                                          "Parallel Aware": false,
+                                          "Async Capable": false,
+                                          "Alias": "v",
+                                          "Startup Cost": 5749.57,
+                                          "Total Cost": 5751.96,
+                                          "Plan Rows": 60,
+                                          "Plan Width": 24,
+                                          "Disabled": false,
+                                          "Output": [
+                                            "v.segment_id",
+                                            "('0.5'::double precision * ((1.0 / (('60'::smallint + v.r))::numeric))::double precision)"
+                                          ],
+                                          "Shared Hit Blocks": 0,
+                                          "Shared Read Blocks": 0,
+                                          "Shared Dirtied Blocks": 0,
+                                          "Shared Written Blocks": 0,
+                                          "Local Hit Blocks": 0,
+                                          "Local Read Blocks": 0,
+                                          "Local Dirtied Blocks": 0,
+                                          "Local Written Blocks": 0,
+                                          "Temp Read Blocks": 0,
+                                          "Temp Written Blocks": 0,
+                                          "Plans": [
+                                            {
+                                              "Node Type": "WindowAgg",
+                                              "Parent Relationship": "Subquery",
+                                              "Parallel Aware": false,
+                                              "Async Capable": false,
+                                              "Startup Cost": 5749.57,
+                                              "Total Cost": 5750.61,
+                                              "Plan Rows": 60,
+                                              "Plan Width": 32,
+                                              "Disabled": false,
+                                              "Output": [
+                                                "ranked_1.segment_id",
+                                                "row_number() OVER w1",
+                                                "ranked_1.dist"
+                                              ],
+                                              "Window": "w1 AS (ORDER BY ranked_1.dist ROWS UNBOUNDED PRECEDING)",
+                                              "Shared Hit Blocks": 0,
+                                              "Shared Read Blocks": 0,
+                                              "Shared Dirtied Blocks": 0,
+                                              "Shared Written Blocks": 0,
+                                              "Local Hit Blocks": 0,
+                                              "Local Read Blocks": 0,
+                                              "Local Dirtied Blocks": 0,
+                                              "Local Written Blocks": 0,
+                                              "Temp Read Blocks": 0,
+                                              "Temp Written Blocks": 0,
+                                              "Plans": [
+                                                {
+                                                  "Node Type": "Subquery Scan",
+                                                  "Parent Relationship": "Outer",
+                                                  "Parallel Aware": false,
+                                                  "Async Capable": false,
+                                                  "Alias": "ranked_1",
+                                                  "Startup Cost": 5749.56,
+                                                  "Total Cost": 5749.71,
+                                                  "Plan Rows": 60,
+                                                  "Plan Width": 24,
+                                                  "Disabled": false,
+                                                  "Output": [
+                                                    "ranked_1.dist",
+                                                    "ranked_1.segment_id"
+                                                  ],
+                                                  "Shared Hit Blocks": 0,
+                                                  "Shared Read Blocks": 0,
+                                                  "Shared Dirtied Blocks": 0,
+                                                  "Shared Written Blocks": 0,
+                                                  "Local Hit Blocks": 0,
+                                                  "Local Read Blocks": 0,
+                                                  "Local Dirtied Blocks": 0,
+                                                  "Local Written Blocks": 0,
+                                                  "Temp Read Blocks": 0,
+                                                  "Temp Written Blocks": 0,
+                                                  "Plans": [
+                                                    {
+                                                      "Node Type": "Limit",
+                                                      "Parent Relationship": "Subquery",
+                                                      "Parallel Aware": false,
+                                                      "Async Capable": false,
+                                                      "Startup Cost": 5749.56,
+                                                      "Total Cost": 5749.71,
+                                                      "Plan Rows": 60,
+                                                      "Plan Width": 24,
+                                                      "Disabled": false,
+                                                      "Output": [
+                                                        "ds_2.id",
+                                                        "((ds_2.embedding <=> '[-0.02739567,0.00839614,0.00670465,0.01350308,0.00338479,0.01003354,0.01068994,0.05020375,-0.00538103,0.02836223,-0.03771052,0.04189416,-0.02859306,-0.01126699,-0.0153208,-0.0306416,0.01226241,0.01830706,0.02293792,0.06653439,0.03707576,-0.02266382,-0.03052619,-0.01683557,-0.01725393,0.03378655,-0.02820354,0.05314673,0.0248422,-0.01427489,0.02928552,-0.03193997,0.0036102,-0.0202979,0.04483714,0.01888411,0.00082591,0.02554909,0.01683557,-0.00223969,-0.02440941,-0.00210445,-0.01774443,0.04431779,-0.00021392,-0.01141847,-0.00931222,0.03026651,0.01194503,0.01097125,0.03058389,-0.00309626,-0.00884336,0.0327767,-0.04847259,0.00123345,-0.00676957,0.03087242,0.01982182,-0.04397156,-0.02899699,0.02100479,0.01700868,0.00914632,-0.01389259,0.01899952,-0.03297867,0.00182403,-0.0176723,0.00400332,-0.04734733,0.02449597,-0.02723698,-0.04068235,0.0380856,-0.00145887,-0.02879502,-0.04076891,0.00281855,-0.0182205,0.00779024,0.04720307,-0.02537598,0.04348106,0.00108108,-0.05326214,-0.00656039,0.03211309,-0.01322176,0.00695351,0.03133406,0.01637392,-0.02101921,0.03323834,-0.01190175,-0.0151044,-0.01879755,0.00564071,-0.01654704,0.00407184,-0.00970894,-0.05409887,-0.04763586,0.07195871,0.0014778,-0.01585457,-0.07992207,-0.00644137,-0.01523424,0.03283441,0.00274462,-0.03237276,0.01366177,0.05098277,0.02290907,0.03211309,0.05585888,-0.02423629,0.03883578,-0.04780897,-0.00038072,0.026155,0.02272153,0.00160313,0.00857647,0.02311104,-0.0282324,0.03987447,-0.00719876,-0.06197567,0.01207487,-0.0216684,-0.03938398,-0.03638329,0.00267068,0.01628737,-0.00337216,0.02785731,-0.00336134,-0.00321528,0.06053303,0.03546001,0.03017996,-0.02195693,0.01605654,-0.01667688,0.0083168,0.01884083,-0.0075522,0.03266129,-0.00799942,-0.0271937,-0.03470983,0.01884083,-0.02478449,-0.00624301,0.0012028,0.00294118,-0.02234644,0.01207487,-0.0290547,-0.08234569,0.0327767,0.01585457,0.0211202,-0.0327767,-0.01611425,0.031738,-0.04172105,0.00719876,-0.00441807,-0.04111514,-0.0016437,0.0538969,0.00097739,5.957e-05,-0.02518843,-0.0496844,-0.0123129,0.03090127,0.02204349,0.09607959,-0.00048599,0.01272405,-0.0062358,-0.03459442,0.02026904,0.00623219,0.03450786,0.01189454,-0.01219028,0.00448299,0.0486457,-0.00038613,0.01212536,-0.02213004,0.03017996,0.028016,-0.03814331,0.04480829,-0.01529195,-0.02699173,0.02762649,-0.00292855,-0.0146644,0.00025607,-0.02446711,0.05776317,-0.02341399,0.00050312,0.04379844,-0.00468136,-0.01395751,0.01459227,-0.00724204,-0.0101778,0.0322862,0.0039961,-0.02156742,0.04423124,-0.01418833,-0.02155299,0.03646985,0.02523171,-0.02625598,0.01964871,-0.03915315,-0.05808055,-0.01592671,0.00713384,0.03872036,-0.01516211,-0.02110577,-0.01514768,-0.04330795,0.01514768,-0.00217297,-0.02339956,-0.0338731,-0.01892739,-0.01195946,0.03892233,-0.02821797,-0.01294766,-0.00905254,-0.00636924,0.03805675,0.00888664,-0.00736105,-0.01019944,0.01024272,-0.02598188,-0.05606085,-0.0306416,0.03970136,-0.00063927,-0.02798715,0.01807624,-0.01268077,-0.01540736,0.00214412,-0.04503911,-0.00785516,-0.02071626,0.00319544,0.01093518,-0.00706171,-0.00346593,0.03032422,-0.00934828,0.01885526,-0.00698597,0.00419447,-0.00513579,0.00311068,-0.02376022,0.00423053,0.00055992,-0.02997799,0.0322862,0.01550834,-0.04024956,0.02667435,-0.04570273,-0.01329389,-0.01516211,0.00404299,-0.01444079,0.06359141,0.01063223,0.05828251,0.01589785,-0.02289464,-0.05796513,-0.03635444,0.01344537,-0.0171818,0.00418365,-0.02191365,-0.0480975,0.01487358,0.01472211,-0.0565225,0.0291124,0.01397193,-0.00237494,-0.00620334,-0.02283693,0.01386374,0.04004759,-0.05135786,-0.00332708,0.02531827,0.01462833,0.03142062,-0.04215384,-0.04342336,0.05294476,0.01332275,0.02915568,0.00401774,-0.00957189,0.02896814,0.03442131,0.00710859,-0.02452482,-0.0306416,-0.02305333,0.04131711,0.00609153,-0.05251197,-0.01951887,0.02634254,0.05233885,-0.00135067,-0.00512497,0.036441,-0.01081256,-0.07178559,0.03646985,-0.01897067,-0.06047532,-0.00756663,-0.00882894,-0.06174484,-0.00491218,0.03817216,0.01200995,0.03782593,0.00368413,0.03283441,0.01987953,0.00266347,0.02119233,-0.02022576,-0.03006454,0.02217332,0.00911025,-0.07322823,0.02465466,0.0001588,0.01002632,0.04010529,0.02543368,-0.00086062,0.00165993,-0.05704185,-0.00999747,0.04463517,4.615e-05,-0.02994913,0.01742705,-0.01715295,-0.05083851,0.02611172,0.0443755,0.03248817,0.01024272,0.01845132,0.0240776,0.00471742,0.06716915,-0.00937714,0.00666859,-0.01052403,0.01556605,-0.0443755,-0.01656147,0.0209038,-0.04042267,0.04431779,-0.00765319,-0.0053053,0.01811951,0.03280555,0.00630793,0.00551087,0.03214194,-0.00955025,0.01568146,-0.02370252,-0.02175496,-0.02847764,0.01807624,0.00517906,-0.00150846,-0.0264291,-0.0287806,0.02191365,-0.07172789,0.00339741,-0.05519527,0.04024956,0.03929742,-0.02873732,0.03020881,-0.04451976,0.00226494,-0.01771558,-0.00999747,-0.00389151,0.02003822,0.00074792,-0.00311429,-0.02673205,0.05216574,0.04241351,-0.03557542,-0.02534712,-0.03072816,0.0380279,-0.04094202,-0.05646479,0.04241351,0.04033612,0.01773,-0.01221913,0.00898041,0.04097088,0.02968946,0.0193169,0.02237529,0.03367114,-0.02673205,0.01219028,0.01545064,0.0544451,0.01128863,-0.03768167,-0.03072816,-0.00148411,0.03476754,-0.0834998,-0.06261043,-0.00595809,0.0269196,-0.01830706,0.01719623,0.02781403,-0.02455367,0.01998052,0.02755436,-0.04550076,-0.06047532,-0.00692826,-0.01372669,0.03667182,0.04143252,0.00243986,-0.00479316,0.03237276,-0.0090814,0.02073069,-0.01168536,-0.01940346,0.02628484,0.02339956,0.01251487,0.03193997,-0.00663252,-0.01169978,0.00069201,-0.06324518,0.00823745,-0.01791755,0.05233885,0.0491362,0.00139305,-0.04273089,-0.00404299,-0.01397193,-0.02078839,0.001641,-0.0173982,0.03952824,-0.04708765,-0.05966745,0.01575359,0.04391386,-0.01221192,0.01235618,-0.03687379,-0.05005949,-0.05216574,0.06151402,-0.00495546,0.01160601,0.00053423,0.05764775,-0.01144011,-0.02950192,-0.01216864,-0.01172864,0.00312331,-0.01897067,0.03560427,-0.07097772,0.00916796,0.01015616,-0.03646985,-0.01077649,-0.00797778,-0.06076385,-0.02109135,0.02495761,-0.02803043,0.01423882,-0.08373062,-0.01839362,-0.0190428,0.01212536,-0.02500089,0.00682728,-0.02344284,0.00924009,0.03797019,0.0030638,-9.732e-05,-0.00957911,0.00146698,-0.01493129,0.01239225,0.00112345,-0.02200021,-0.02331301,0.03046848,-0.02798715,0.0012055,-0.01048075,0.02137987,-0.00694269,-0.04304827,-0.00249396,0.03586394,-7.72e-05,0.00752335,0.03592165,0.01949002,0.00516825,0.0264291,-0.01469325,-0.0333249,-0.00205936,-0.0282901,-0.00096927,0.01308471,-0.02849207,0.00058787,0.00730335,0.00350921,0.0010955,0.01517654,-0.03470983,-0.02896814,0.02065855,-0.01215421,0.05859989,-0.05989827,0.03156489,0.00012781,-0.0083168,-0.02794387,0.02250513,-0.00052025,-0.01087748,0.00828795,0.01787427,-0.01076207,0.00978829,0.0099614,0.01937461,0.01624409,0.01519096,-0.02231759,-0.01956215,0.00256789,-0.02485663,0.00031332,-0.01412341,0.01563818,-0.04954014,-0.00650268,0.01164929,-0.008865,-0.01731164,-0.0126375,-0.0110001,-0.00856926,-0.03825872,-0.03084357,-0.00204494,-0.00418725,0.02866519,0.00778302,0.00571645,-0.01141847,-0.0062899,-0.00469578,0.0272514,0.00145706,-0.02494318,-0.00566235,-0.02357268,-0.01783099,-0.0066758,0.03681608,-0.01289717,0.00597251,-0.01462112,-0.03179571,-0.00932665,-0.00758827,0.00928337,0.02351497,-0.03468098,-0.00658203,-0.00184477,-0.00931222,0.02559237,-0.00592202,0.00709056,0.0119306,-0.00199805,-0.03791249,0.01432538,0.00786958,-0.0108342,-0.02207234,0.03315179,0.01488801,0.02648681,0.01103617,0.02526057,0.01195224,-0.03196882,-0.01592671,-0.00405381,-0.00411151,-0.02426515,0.0285642,0.00583186,-0.01446243,0.00522234,0.00094493,-0.03900889,0.05164639,-0.01582572,-0.03121865,0.00397446,-0.0142821,0.06884261,0.03750855,0.05098277,-0.02086052,0.03724888,-0.01888411,0.0128034,-0.05738808,-0.00614563,-0.0009003,-0.05386805,0.00367512,-0.04102858,-0.00753778,-0.01321455,-0.01873985,-0.00798499,0.01308471,-0.05819596,-0.0049807,-0.03185342,0.03921086,0.0169077,-0.01666245,-0.00428102,-0.01599884,0.0007912,0.00267789,-0.00299527,0.01924477,0.00655678,0.02769862,-0.02892486,-0.05130015,-0.01836476,0.03805675,0.03667182,0.02583762,0.04876111,0.01315685,0.00117575,0.0322285,-0.0180041,0.05052113,-0.02006707,0.01081977,-0.00622858,0.03006454,-0.01571031,0.03191112,0.04397156,0.02803043,-0.02712157,0.03352687,-0.01679229,0.0080427,-0.03306523,-0.02096151,-0.02798715,-0.02032675,-0.00934828,0.02451039,0.00340462,0.01591228,-0.01507555,0.03170915,-0.02745337,-0.02667435,0.02775633,0.02156742,0.00608793,0.0256645,-0.02717927,-0.02195693,-0.01330832,0.03274785,0.03026651,-0.04659716,-0.01178634,0.01405849,0.02678976,0.01263028,0.01878313,-0.00043054,-0.0062394,-0.04226925,-0.00792729,-0.01858116,-0.0218848,0.00478955,0.02645795,0.01579687,0.02443826,-0.0104519,-0.00957189,-0.01726836,-0.00162567,-0.00418725,-0.02060085,0.01761459,0.02449597,-0.02885273,0.00357413,0.02237529,0.01781656,-0.00864139,-0.02125004,0.01882641,0.00510333,0.02430842,-0.01476538,-0.05611856,-0.04610666,0.00789843,-0.02339956,-0.00374003,0.01239946,0.00041589,0.00907418,0.00335954,0.01752803,0.01189454,-0.01595556,0.02308218,0.04593354,0.02844879,0.00956468,-0.02761206,-0.02452482,-0.00547481,0.03165144,0.01323619,-6.689e-05,-0.02047101,-0.00587514,0.03280555,-0.00108739,0.0089732,-0.00817254,0.02012478,-0.02099036,0.00799221,0.00476431,-0.00645219,-0.0174559,-0.01234176,-0.0240199,-0.02204349,0.00193313,-0.00451185,0.04985752,-0.02935765,0.00278429,-0.00368774,-0.00735745,0.00556858,0.01609982,0.0133516,-0.01473653,-0.01167814,0.0174559,-0.01529195,-0.00367512,-0.00383741,-0.03179571,0.02426515,0.01160601,-0.00729253,-0.02644353,0.03084357,0.04013415,0.03883578,-0.01023551,-0.00378331,-0.0010946,-0.06001368,-0.01706639,0.02189922,-0.00604825,0.02771305,-0.02403432,-0.03482524,0.03341146,0.02830453,-0.00539907,0.01014173,-0.00440365,-0.00133173,0.01236339,-0.03156489,-0.02322645,0.03020881,0.00810762,-0.04183646,0.01115158,0.01038698,-0.00780466,0.00445414,0.01212536,0.0203556,0.00217477,-0.00085116,-0.00655318,-0.01920149,-0.01788869,0.00236412,-0.02787174,0.00107837,-0.01113715,-0.04050923,0.04042267,0.02752551,0.03170915,-0.02590975,-0.0267032,-0.04400041,-0.01160601,0.05585888,0.02132217,0.00846828,-0.00974501,0.01424604,-0.0088073,-0.07778696,0.01304143,-0.04114399,-0.00112255,0.02974716,0.01428931,-0.03569083,-0.01516211,0.01434702,0.01254372,-0.0123129,0.02039888,0.02179824,-0.02944421,0.01392866,0.01768672,0.03185342,-0.04483714,0.00508529,-0.00992534,-0.0039925,0.02957405,0.04653945,-0.01244274,0.00647022,0.03822987,-0.04639519,0.00406102,-0.01086305,0.02817469,-0.01667688,-0.01507555,0.02787174,-0.04368303,0.02609729,-0.00713384,-0.01021387,0.01011288,0.02468351,-0.01622966,0.01365455,0.01757131,-0.01289717,0.01930248,0.03563312,0.02364481,-0.00883615,0.02078839,0.03000684,-0.03211309,0.00504562,0.01571031,0.01372669,0.01637392,0.0385761,0.00113608,-0.0369892,0.05519527,-0.01208208,0.03193997,-0.03090127,0.01601326,-0.03776822,0.01192339,0.00222166,0.00015982,0.04362533,-0.00320085,0.03078586,-0.02054314,0.00621055,0.00477152,0.04420238,-0.0104519,0.001861,0.0333249,-0.01071879,-0.03424819,-0.03121865,0.02627041,0.02096151,0.02495761,0.00896599,-0.02106249,-0.02583762,0.01987953,0.0025156,0.00844664,0.04884767,-0.00745843,0.00402856,0.02087495,-0.03361343,0.0412017,-0.01868214,-0.01716737,0.01012731,-0.01684999,-0.0496267,-0.00290511,0.0327767,-0.00827352,0.02608287,-0.00027523,0.0027356,-0.0045407,0.01819165,-0.00595448,-0.0090309,0.02455367,0.01294766,-0.01407292,-0.00412233,0.0056912,-0.01686442,0.01920149,0.00644137,-0.01085584,-0.00078984,0.00753056,-0.00991813,-0.0338731,-0.02445269,0.02635697,-0.0354023,-0.01419554,0.00166534,-0.04578928,0.01631622,-0.00385905,0.0144985,-0.00122624,-0.04123055,0.03061275,-0.04933817,0.02651566,0.01640278,0.01758574,-0.02650123,0.0013119,0.01462112,0.02524614,0.00709416,-0.02702058,0.0031197,-0.01224798,-0.01599884,0.0013137,0.00571284,0.02211562,0.0049771,-0.02487105,0.0250586,-0.03603706,0.00160583,0.00914632,0.0093555,0.00630432,-0.02831895,0.0155949,-0.03355572,0.0343636,-0.0180041,0.0402207,0.0013146,0.02950192,0.01211815,-0.00016557,0.0014219,-0.01116601,-0.02678976,0.01615753,-0.01381324,0.01129584,0.00490136,-0.0021333,0.0085909,0.00635121,-0.00943484,-0.00173928,0.04671257,-0.01527752,-0.0311898,0.00367151,0.00748728,-0.00848992,0.0184946,0.01116601,0.02381793,0.01888411,0.0517618,-0.05960974,-0.04062464,0.04024956,0.01622966,0.00658924,-0.00989649,-0.04835717,0.0192592,-0.01643163,-0.00769647,-0.00695711,-0.02334186,0.00810762,0.01467883,0.01374833,0.01137519,0.01736934,0.01000468,0.0433368,0.00380135,-0.02182709,-0.00964403,0.00513218,-0.01292602,0.01218307,0.00728892,0.0126375,-0.0182205,0.03355572,-0.01119486,-0.02123561,-0.01858116,-0.00770368,-0.04013415,-0.02250513,0.00556497,-0.02472679,-0.02109135,-0.0006307,0.01879755,0.01163486,-0.0034479,0.02632812,0.00126952,0.00338118,-0.0237458,-0.01703754,0.01936018,0.03494066,0.00216576,-0.00287085,0.00856205,0.00561186,-0.02762649,0.00440365,0.01036534,0.01107945,-0.00334692,-0.01063223,-0.007224,0.01514768,0.01917264,-0.00580301,0.11114071,-0.01381324,-0.02676091,-0.0083745,0.00078083,-0.04613551,-0.01892739,0.03854725,0.00212068,0.05132901,-0.00677679,-0.01030042,0.00788401,0.00159952,0.02709271,0.03903774,0.01172864,-0.01604212,-0.00442168,-0.03147833,0.00759548,-0.01722508,0.02803043,0.02198578,0.01744148,-0.00038681,0.00167346,-0.04293286,-0.02110577,-0.02827568,-0.01293324,0.00800663,-0.01814837,0.00628268,0.02210119,-0.00385905,-0.01354636,-0.03996103,-0.0113247,0.01814837,0.00769647,0.01353193,-0.01602769,-0.03629673,0.00463086,0.01040141,0.01705196,0.0138998,0.00739351,0.03693149,-0.00063341,0.01571031,-0.00582825,0.02397662,0.01560933,-0.01843689,-0.00943484,0.00148321,0.00892992,-0.00491939,0.0088073,-0.0198074,0.01853788,0.01640278,-0.01199552,0.01396472,-0.01177913,-0.02237529,0.00607711,0.0129116,0.01247159,0.0332672,0.00732138,-0.04345221,0.01420276,-0.01572474,0.047607,0.00954304,-0.05822481,-0.00717712,0.02513073,0.00414397,0.01382046,-0.0322862,-0.00420529,0.01832148,-0.04509682,-0.02891044,-0.00790565,0.01150503,0.02504417,-0.01761459,-0.00277708,-0.00720597,-0.01084141,-0.01221192,0.00064062,-0.04212499,0.01842247,0.01797525,-0.02997799,-0.05170409,-0.02704943,0.00695351,-0.0012064,-0.02492876,-0.00082005,-0.00302954,0.00424496,-0.03791249,-0.00192231,-0.00467414,-0.00275724,-0.0465683,0.02384678,0.02376022,-0.03773937,-0.01521982,0.00650629,0.04019185,0.00786237,-0.03889348,0.01933133,-0.02573664,0.02184152,0.01442636,-0.0166336,0.03681608,-0.03147833,-0.01245717,0.02091823,-0.00993977,0.02585205,-0.01855231,0.02259169,0.01498899,0.02162512,-0.01332275,0.00792729,-0.02329858,0.01983625,0.02233201,0.00870631,-0.01005518,0.00623219,-0.0101778,0.0332672,0.00215133,0.00526562,-0.03185342,-0.00949976,-0.01643163,0.00243806,-0.01372669,-0.00757384,0.02608287,-0.03364228,0.01413784,-0.01009846,0.01974969,-0.0085909,0.02755436,-0.04019185,-0.0010414,0.00586792,-0.00311609,0.00024728,0.04576043,-0.01357521,0.00905254,0.01941789,-0.01206765,-0.02049986,0.00024412,-0.00235871,0.01369062,-0.01078371,0.01744148,-0.01732606,0.01643163,0.00982435,-0.01917264,0.02064413,0.02351497,-0.03199768,0.02833338,-0.00440004,-0.01401521,0.0032279,-0.00303495,0.01617195,-0.00661449,0.0043243,-0.00028808,-0.03768167,-0.01485916,-0.01589785,0.04584699,-0.01082699,-0.00105944,0.02191365,0.02971831,0.01446964,0.04951128,0.00893713,-0.02060085,0.03886463,-0.00291232,-0.0166336,-0.01158437,0.03759511,-0.02577991,-0.02322645,-0.03107439,-0.01007682,0.04449091,0.01327226,0.01996609,-0.02624156,-0.0072781,0.00340643,-0.00965124,0.01713852,-0.00088001,-0.03101669,-0.01771558,0.02162512,-0.00185739,-0.015869,-0.02259169,0.00725285,0.01403685,-0.00247592,0.0066217,0.0153785,-0.00735023,-0.01320012,-0.00382659,-0.01881198,0.00731777,0.00177715,-0.00947812,-0.01816279,-0.00194215,-0.01918706,0.02592418,0.06243731,0.00183485,-0.03473869,0.03468098,-0.04408697,0.02377465,0.04778012,-0.02717927,0.00718072,-0.00532333,0.00659646,-0.01491686,0.01125256,-0.00843221,0.01774443,-0.01271684,-0.0096296,-0.02427957,-0.04010529,0.02075954,-0.03309408,-0.02048544,-0.03323834,-0.01506113,0.01989396,0.00944927,0.02501532,-0.00911746,-0.01253651,0.0293288,0.00603022,0.02918454,0.02517401,0.00578497,-0.01930248,0.00014032,-0.01823493,-0.04036497,-0.03012225,-0.00531251,-0.00858369,0.01123814,-0.00045759,0.01051682,0.01618638,-0.01771558,0.03283441,-0.00241822,-0.00748728,0.01687885,0.0064017,0.01979297,-0.01497457,-0.02224546,0.03834528,0.01899952,-0.00513579,-0.00755942,-0.00685974,-0.01112994,0.04521223,0.03667182,0.02448154,-0.03248817,0.0729397,0.02554909,-0.00972337,-0.00077857,-0.01234176,0.05718611,0.02289464,0.02575106,-0.00212609,0.05415658,0.01785984,0.00436398,-0.01592671,-0.06826556,0.00824467,-0.03127636,0.01304143,0.040163,0.02603959,0.00663613,0.01230569,-0.00496628,-0.03511377,-0.01122371,0.02032675,-0.05060769,-0.00544595,-0.00538825,-0.00973058,-0.040163,-0.03410393,0.02363039,-0.00138493,0.02950192,-0.02638582,-0.01798968,-0.026155,-0.01474375,-0.00409709,0.00042197,-0.03346917,-0.02107692,-0.03156489,-0.02966061,-0.01199552,-0.03139177,0.01999494,0.01777328,-0.01755689,0.00643416,0.00657121,0.04480829,0.03309408,0.02475564,-0.00396364,0.01735492,-0.00429545,0.02295235,0.01265192,0.02433728,-0.01966313,0.00107116,-0.00841057,-0.00819418,0.03502721,-0.02331301,0.03716232,0.01205323,-0.03973021,0.01760017,-0.00665055,-0.01703754,-0.03799905,-0.00132723,-0.01206044,0.03494066,0.02104807,0.00625744,0.0090309]'::vector))"
+                                                      ],
+                                                      "Shared Hit Blocks": 0,
+                                                      "Shared Read Blocks": 0,
+                                                      "Shared Dirtied Blocks": 0,
+                                                      "Shared Written Blocks": 0,
+                                                      "Local Hit Blocks": 0,
+                                                      "Local Read Blocks": 0,
+                                                      "Local Dirtied Blocks": 0,
+                                                      "Local Written Blocks": 0,
+                                                      "Temp Read Blocks": 0,
+                                                      "Temp Written Blocks": 0,
+                                                      "Plans": [
+                                                        {
+                                                          "Node Type": "Sort",
+                                                          "Parent Relationship": "Outer",
+                                                          "Parallel Aware": false,
+                                                          "Async Capable": false,
+                                                          "Startup Cost": 5749.56,
+                                                          "Total Cost": 5765.03,
+                                                          "Plan Rows": 6191,
+                                                          "Plan Width": 24,
+                                                          "Disabled": false,
+                                                          "Output": [
+                                                            "ds_2.id",
+                                                            "((ds_2.embedding <=> '[-0.02739567,0.00839614,0.00670465,0.01350308,0.00338479,0.01003354,0.01068994,0.05020375,-0.00538103,0.02836223,-0.03771052,0.04189416,-0.02859306,-0.01126699,-0.0153208,-0.0306416,0.01226241,0.01830706,0.02293792,0.06653439,0.03707576,-0.02266382,-0.03052619,-0.01683557,-0.01725393,0.03378655,-0.02820354,0.05314673,0.0248422,-0.01427489,0.02928552,-0.03193997,0.0036102,-0.0202979,0.04483714,0.01888411,0.00082591,0.02554909,0.01683557,-0.00223969,-0.02440941,-0.00210445,-0.01774443,0.04431779,-0.00021392,-0.01141847,-0.00931222,0.03026651,0.01194503,0.01097125,0.03058389,-0.00309626,-0.00884336,0.0327767,-0.04847259,0.00123345,-0.00676957,0.03087242,0.01982182,-0.04397156,-0.02899699,0.02100479,0.01700868,0.00914632,-0.01389259,0.01899952,-0.03297867,0.00182403,-0.0176723,0.00400332,-0.04734733,0.02449597,-0.02723698,-0.04068235,0.0380856,-0.00145887,-0.02879502,-0.04076891,0.00281855,-0.0182205,0.00779024,0.04720307,-0.02537598,0.04348106,0.00108108,-0.05326214,-0.00656039,0.03211309,-0.01322176,0.00695351,0.03133406,0.01637392,-0.02101921,0.03323834,-0.01190175,-0.0151044,-0.01879755,0.00564071,-0.01654704,0.00407184,-0.00970894,-0.05409887,-0.04763586,0.07195871,0.0014778,-0.01585457,-0.07992207,-0.00644137,-0.01523424,0.03283441,0.00274462,-0.03237276,0.01366177,0.05098277,0.02290907,0.03211309,0.05585888,-0.02423629,0.03883578,-0.04780897,-0.00038072,0.026155,0.02272153,0.00160313,0.00857647,0.02311104,-0.0282324,0.03987447,-0.00719876,-0.06197567,0.01207487,-0.0216684,-0.03938398,-0.03638329,0.00267068,0.01628737,-0.00337216,0.02785731,-0.00336134,-0.00321528,0.06053303,0.03546001,0.03017996,-0.02195693,0.01605654,-0.01667688,0.0083168,0.01884083,-0.0075522,0.03266129,-0.00799942,-0.0271937,-0.03470983,0.01884083,-0.02478449,-0.00624301,0.0012028,0.00294118,-0.02234644,0.01207487,-0.0290547,-0.08234569,0.0327767,0.01585457,0.0211202,-0.0327767,-0.01611425,0.031738,-0.04172105,0.00719876,-0.00441807,-0.04111514,-0.0016437,0.0538969,0.00097739,5.957e-05,-0.02518843,-0.0496844,-0.0123129,0.03090127,0.02204349,0.09607959,-0.00048599,0.01272405,-0.0062358,-0.03459442,0.02026904,0.00623219,0.03450786,0.01189454,-0.01219028,0.00448299,0.0486457,-0.00038613,0.01212536,-0.02213004,0.03017996,0.028016,-0.03814331,0.04480829,-0.01529195,-0.02699173,0.02762649,-0.00292855,-0.0146644,0.00025607,-0.02446711,0.05776317,-0.02341399,0.00050312,0.04379844,-0.00468136,-0.01395751,0.01459227,-0.00724204,-0.0101778,0.0322862,0.0039961,-0.02156742,0.04423124,-0.01418833,-0.02155299,0.03646985,0.02523171,-0.02625598,0.01964871,-0.03915315,-0.05808055,-0.01592671,0.00713384,0.03872036,-0.01516211,-0.02110577,-0.01514768,-0.04330795,0.01514768,-0.00217297,-0.02339956,-0.0338731,-0.01892739,-0.01195946,0.03892233,-0.02821797,-0.01294766,-0.00905254,-0.00636924,0.03805675,0.00888664,-0.00736105,-0.01019944,0.01024272,-0.02598188,-0.05606085,-0.0306416,0.03970136,-0.00063927,-0.02798715,0.01807624,-0.01268077,-0.01540736,0.00214412,-0.04503911,-0.00785516,-0.02071626,0.00319544,0.01093518,-0.00706171,-0.00346593,0.03032422,-0.00934828,0.01885526,-0.00698597,0.00419447,-0.00513579,0.00311068,-0.02376022,0.00423053,0.00055992,-0.02997799,0.0322862,0.01550834,-0.04024956,0.02667435,-0.04570273,-0.01329389,-0.01516211,0.00404299,-0.01444079,0.06359141,0.01063223,0.05828251,0.01589785,-0.02289464,-0.05796513,-0.03635444,0.01344537,-0.0171818,0.00418365,-0.02191365,-0.0480975,0.01487358,0.01472211,-0.0565225,0.0291124,0.01397193,-0.00237494,-0.00620334,-0.02283693,0.01386374,0.04004759,-0.05135786,-0.00332708,0.02531827,0.01462833,0.03142062,-0.04215384,-0.04342336,0.05294476,0.01332275,0.02915568,0.00401774,-0.00957189,0.02896814,0.03442131,0.00710859,-0.02452482,-0.0306416,-0.02305333,0.04131711,0.00609153,-0.05251197,-0.01951887,0.02634254,0.05233885,-0.00135067,-0.00512497,0.036441,-0.01081256,-0.07178559,0.03646985,-0.01897067,-0.06047532,-0.00756663,-0.00882894,-0.06174484,-0.00491218,0.03817216,0.01200995,0.03782593,0.00368413,0.03283441,0.01987953,0.00266347,0.02119233,-0.02022576,-0.03006454,0.02217332,0.00911025,-0.07322823,0.02465466,0.0001588,0.01002632,0.04010529,0.02543368,-0.00086062,0.00165993,-0.05704185,-0.00999747,0.04463517,4.615e-05,-0.02994913,0.01742705,-0.01715295,-0.05083851,0.02611172,0.0443755,0.03248817,0.01024272,0.01845132,0.0240776,0.00471742,0.06716915,-0.00937714,0.00666859,-0.01052403,0.01556605,-0.0443755,-0.01656147,0.0209038,-0.04042267,0.04431779,-0.00765319,-0.0053053,0.01811951,0.03280555,0.00630793,0.00551087,0.03214194,-0.00955025,0.01568146,-0.02370252,-0.02175496,-0.02847764,0.01807624,0.00517906,-0.00150846,-0.0264291,-0.0287806,0.02191365,-0.07172789,0.00339741,-0.05519527,0.04024956,0.03929742,-0.02873732,0.03020881,-0.04451976,0.00226494,-0.01771558,-0.00999747,-0.00389151,0.02003822,0.00074792,-0.00311429,-0.02673205,0.05216574,0.04241351,-0.03557542,-0.02534712,-0.03072816,0.0380279,-0.04094202,-0.05646479,0.04241351,0.04033612,0.01773,-0.01221913,0.00898041,0.04097088,0.02968946,0.0193169,0.02237529,0.03367114,-0.02673205,0.01219028,0.01545064,0.0544451,0.01128863,-0.03768167,-0.03072816,-0.00148411,0.03476754,-0.0834998,-0.06261043,-0.00595809,0.0269196,-0.01830706,0.01719623,0.02781403,-0.02455367,0.01998052,0.02755436,-0.04550076,-0.06047532,-0.00692826,-0.01372669,0.03667182,0.04143252,0.00243986,-0.00479316,0.03237276,-0.0090814,0.02073069,-0.01168536,-0.01940346,0.02628484,0.02339956,0.01251487,0.03193997,-0.00663252,-0.01169978,0.00069201,-0.06324518,0.00823745,-0.01791755,0.05233885,0.0491362,0.00139305,-0.04273089,-0.00404299,-0.01397193,-0.02078839,0.001641,-0.0173982,0.03952824,-0.04708765,-0.05966745,0.01575359,0.04391386,-0.01221192,0.01235618,-0.03687379,-0.05005949,-0.05216574,0.06151402,-0.00495546,0.01160601,0.00053423,0.05764775,-0.01144011,-0.02950192,-0.01216864,-0.01172864,0.00312331,-0.01897067,0.03560427,-0.07097772,0.00916796,0.01015616,-0.03646985,-0.01077649,-0.00797778,-0.06076385,-0.02109135,0.02495761,-0.02803043,0.01423882,-0.08373062,-0.01839362,-0.0190428,0.01212536,-0.02500089,0.00682728,-0.02344284,0.00924009,0.03797019,0.0030638,-9.732e-05,-0.00957911,0.00146698,-0.01493129,0.01239225,0.00112345,-0.02200021,-0.02331301,0.03046848,-0.02798715,0.0012055,-0.01048075,0.02137987,-0.00694269,-0.04304827,-0.00249396,0.03586394,-7.72e-05,0.00752335,0.03592165,0.01949002,0.00516825,0.0264291,-0.01469325,-0.0333249,-0.00205936,-0.0282901,-0.00096927,0.01308471,-0.02849207,0.00058787,0.00730335,0.00350921,0.0010955,0.01517654,-0.03470983,-0.02896814,0.02065855,-0.01215421,0.05859989,-0.05989827,0.03156489,0.00012781,-0.0083168,-0.02794387,0.02250513,-0.00052025,-0.01087748,0.00828795,0.01787427,-0.01076207,0.00978829,0.0099614,0.01937461,0.01624409,0.01519096,-0.02231759,-0.01956215,0.00256789,-0.02485663,0.00031332,-0.01412341,0.01563818,-0.04954014,-0.00650268,0.01164929,-0.008865,-0.01731164,-0.0126375,-0.0110001,-0.00856926,-0.03825872,-0.03084357,-0.00204494,-0.00418725,0.02866519,0.00778302,0.00571645,-0.01141847,-0.0062899,-0.00469578,0.0272514,0.00145706,-0.02494318,-0.00566235,-0.02357268,-0.01783099,-0.0066758,0.03681608,-0.01289717,0.00597251,-0.01462112,-0.03179571,-0.00932665,-0.00758827,0.00928337,0.02351497,-0.03468098,-0.00658203,-0.00184477,-0.00931222,0.02559237,-0.00592202,0.00709056,0.0119306,-0.00199805,-0.03791249,0.01432538,0.00786958,-0.0108342,-0.02207234,0.03315179,0.01488801,0.02648681,0.01103617,0.02526057,0.01195224,-0.03196882,-0.01592671,-0.00405381,-0.00411151,-0.02426515,0.0285642,0.00583186,-0.01446243,0.00522234,0.00094493,-0.03900889,0.05164639,-0.01582572,-0.03121865,0.00397446,-0.0142821,0.06884261,0.03750855,0.05098277,-0.02086052,0.03724888,-0.01888411,0.0128034,-0.05738808,-0.00614563,-0.0009003,-0.05386805,0.00367512,-0.04102858,-0.00753778,-0.01321455,-0.01873985,-0.00798499,0.01308471,-0.05819596,-0.0049807,-0.03185342,0.03921086,0.0169077,-0.01666245,-0.00428102,-0.01599884,0.0007912,0.00267789,-0.00299527,0.01924477,0.00655678,0.02769862,-0.02892486,-0.05130015,-0.01836476,0.03805675,0.03667182,0.02583762,0.04876111,0.01315685,0.00117575,0.0322285,-0.0180041,0.05052113,-0.02006707,0.01081977,-0.00622858,0.03006454,-0.01571031,0.03191112,0.04397156,0.02803043,-0.02712157,0.03352687,-0.01679229,0.0080427,-0.03306523,-0.02096151,-0.02798715,-0.02032675,-0.00934828,0.02451039,0.00340462,0.01591228,-0.01507555,0.03170915,-0.02745337,-0.02667435,0.02775633,0.02156742,0.00608793,0.0256645,-0.02717927,-0.02195693,-0.01330832,0.03274785,0.03026651,-0.04659716,-0.01178634,0.01405849,0.02678976,0.01263028,0.01878313,-0.00043054,-0.0062394,-0.04226925,-0.00792729,-0.01858116,-0.0218848,0.00478955,0.02645795,0.01579687,0.02443826,-0.0104519,-0.00957189,-0.01726836,-0.00162567,-0.00418725,-0.02060085,0.01761459,0.02449597,-0.02885273,0.00357413,0.02237529,0.01781656,-0.00864139,-0.02125004,0.01882641,0.00510333,0.02430842,-0.01476538,-0.05611856,-0.04610666,0.00789843,-0.02339956,-0.00374003,0.01239946,0.00041589,0.00907418,0.00335954,0.01752803,0.01189454,-0.01595556,0.02308218,0.04593354,0.02844879,0.00956468,-0.02761206,-0.02452482,-0.00547481,0.03165144,0.01323619,-6.689e-05,-0.02047101,-0.00587514,0.03280555,-0.00108739,0.0089732,-0.00817254,0.02012478,-0.02099036,0.00799221,0.00476431,-0.00645219,-0.0174559,-0.01234176,-0.0240199,-0.02204349,0.00193313,-0.00451185,0.04985752,-0.02935765,0.00278429,-0.00368774,-0.00735745,0.00556858,0.01609982,0.0133516,-0.01473653,-0.01167814,0.0174559,-0.01529195,-0.00367512,-0.00383741,-0.03179571,0.02426515,0.01160601,-0.00729253,-0.02644353,0.03084357,0.04013415,0.03883578,-0.01023551,-0.00378331,-0.0010946,-0.06001368,-0.01706639,0.02189922,-0.00604825,0.02771305,-0.02403432,-0.03482524,0.03341146,0.02830453,-0.00539907,0.01014173,-0.00440365,-0.00133173,0.01236339,-0.03156489,-0.02322645,0.03020881,0.00810762,-0.04183646,0.01115158,0.01038698,-0.00780466,0.00445414,0.01212536,0.0203556,0.00217477,-0.00085116,-0.00655318,-0.01920149,-0.01788869,0.00236412,-0.02787174,0.00107837,-0.01113715,-0.04050923,0.04042267,0.02752551,0.03170915,-0.02590975,-0.0267032,-0.04400041,-0.01160601,0.05585888,0.02132217,0.00846828,-0.00974501,0.01424604,-0.0088073,-0.07778696,0.01304143,-0.04114399,-0.00112255,0.02974716,0.01428931,-0.03569083,-0.01516211,0.01434702,0.01254372,-0.0123129,0.02039888,0.02179824,-0.02944421,0.01392866,0.01768672,0.03185342,-0.04483714,0.00508529,-0.00992534,-0.0039925,0.02957405,0.04653945,-0.01244274,0.00647022,0.03822987,-0.04639519,0.00406102,-0.01086305,0.02817469,-0.01667688,-0.01507555,0.02787174,-0.04368303,0.02609729,-0.00713384,-0.01021387,0.01011288,0.02468351,-0.01622966,0.01365455,0.01757131,-0.01289717,0.01930248,0.03563312,0.02364481,-0.00883615,0.02078839,0.03000684,-0.03211309,0.00504562,0.01571031,0.01372669,0.01637392,0.0385761,0.00113608,-0.0369892,0.05519527,-0.01208208,0.03193997,-0.03090127,0.01601326,-0.03776822,0.01192339,0.00222166,0.00015982,0.04362533,-0.00320085,0.03078586,-0.02054314,0.00621055,0.00477152,0.04420238,-0.0104519,0.001861,0.0333249,-0.01071879,-0.03424819,-0.03121865,0.02627041,0.02096151,0.02495761,0.00896599,-0.02106249,-0.02583762,0.01987953,0.0025156,0.00844664,0.04884767,-0.00745843,0.00402856,0.02087495,-0.03361343,0.0412017,-0.01868214,-0.01716737,0.01012731,-0.01684999,-0.0496267,-0.00290511,0.0327767,-0.00827352,0.02608287,-0.00027523,0.0027356,-0.0045407,0.01819165,-0.00595448,-0.0090309,0.02455367,0.01294766,-0.01407292,-0.00412233,0.0056912,-0.01686442,0.01920149,0.00644137,-0.01085584,-0.00078984,0.00753056,-0.00991813,-0.0338731,-0.02445269,0.02635697,-0.0354023,-0.01419554,0.00166534,-0.04578928,0.01631622,-0.00385905,0.0144985,-0.00122624,-0.04123055,0.03061275,-0.04933817,0.02651566,0.01640278,0.01758574,-0.02650123,0.0013119,0.01462112,0.02524614,0.00709416,-0.02702058,0.0031197,-0.01224798,-0.01599884,0.0013137,0.00571284,0.02211562,0.0049771,-0.02487105,0.0250586,-0.03603706,0.00160583,0.00914632,0.0093555,0.00630432,-0.02831895,0.0155949,-0.03355572,0.0343636,-0.0180041,0.0402207,0.0013146,0.02950192,0.01211815,-0.00016557,0.0014219,-0.01116601,-0.02678976,0.01615753,-0.01381324,0.01129584,0.00490136,-0.0021333,0.0085909,0.00635121,-0.00943484,-0.00173928,0.04671257,-0.01527752,-0.0311898,0.00367151,0.00748728,-0.00848992,0.0184946,0.01116601,0.02381793,0.01888411,0.0517618,-0.05960974,-0.04062464,0.04024956,0.01622966,0.00658924,-0.00989649,-0.04835717,0.0192592,-0.01643163,-0.00769647,-0.00695711,-0.02334186,0.00810762,0.01467883,0.01374833,0.01137519,0.01736934,0.01000468,0.0433368,0.00380135,-0.02182709,-0.00964403,0.00513218,-0.01292602,0.01218307,0.00728892,0.0126375,-0.0182205,0.03355572,-0.01119486,-0.02123561,-0.01858116,-0.00770368,-0.04013415,-0.02250513,0.00556497,-0.02472679,-0.02109135,-0.0006307,0.01879755,0.01163486,-0.0034479,0.02632812,0.00126952,0.00338118,-0.0237458,-0.01703754,0.01936018,0.03494066,0.00216576,-0.00287085,0.00856205,0.00561186,-0.02762649,0.00440365,0.01036534,0.01107945,-0.00334692,-0.01063223,-0.007224,0.01514768,0.01917264,-0.00580301,0.11114071,-0.01381324,-0.02676091,-0.0083745,0.00078083,-0.04613551,-0.01892739,0.03854725,0.00212068,0.05132901,-0.00677679,-0.01030042,0.00788401,0.00159952,0.02709271,0.03903774,0.01172864,-0.01604212,-0.00442168,-0.03147833,0.00759548,-0.01722508,0.02803043,0.02198578,0.01744148,-0.00038681,0.00167346,-0.04293286,-0.02110577,-0.02827568,-0.01293324,0.00800663,-0.01814837,0.00628268,0.02210119,-0.00385905,-0.01354636,-0.03996103,-0.0113247,0.01814837,0.00769647,0.01353193,-0.01602769,-0.03629673,0.00463086,0.01040141,0.01705196,0.0138998,0.00739351,0.03693149,-0.00063341,0.01571031,-0.00582825,0.02397662,0.01560933,-0.01843689,-0.00943484,0.00148321,0.00892992,-0.00491939,0.0088073,-0.0198074,0.01853788,0.01640278,-0.01199552,0.01396472,-0.01177913,-0.02237529,0.00607711,0.0129116,0.01247159,0.0332672,0.00732138,-0.04345221,0.01420276,-0.01572474,0.047607,0.00954304,-0.05822481,-0.00717712,0.02513073,0.00414397,0.01382046,-0.0322862,-0.00420529,0.01832148,-0.04509682,-0.02891044,-0.00790565,0.01150503,0.02504417,-0.01761459,-0.00277708,-0.00720597,-0.01084141,-0.01221192,0.00064062,-0.04212499,0.01842247,0.01797525,-0.02997799,-0.05170409,-0.02704943,0.00695351,-0.0012064,-0.02492876,-0.00082005,-0.00302954,0.00424496,-0.03791249,-0.00192231,-0.00467414,-0.00275724,-0.0465683,0.02384678,0.02376022,-0.03773937,-0.01521982,0.00650629,0.04019185,0.00786237,-0.03889348,0.01933133,-0.02573664,0.02184152,0.01442636,-0.0166336,0.03681608,-0.03147833,-0.01245717,0.02091823,-0.00993977,0.02585205,-0.01855231,0.02259169,0.01498899,0.02162512,-0.01332275,0.00792729,-0.02329858,0.01983625,0.02233201,0.00870631,-0.01005518,0.00623219,-0.0101778,0.0332672,0.00215133,0.00526562,-0.03185342,-0.00949976,-0.01643163,0.00243806,-0.01372669,-0.00757384,0.02608287,-0.03364228,0.01413784,-0.01009846,0.01974969,-0.0085909,0.02755436,-0.04019185,-0.0010414,0.00586792,-0.00311609,0.00024728,0.04576043,-0.01357521,0.00905254,0.01941789,-0.01206765,-0.02049986,0.00024412,-0.00235871,0.01369062,-0.01078371,0.01744148,-0.01732606,0.01643163,0.00982435,-0.01917264,0.02064413,0.02351497,-0.03199768,0.02833338,-0.00440004,-0.01401521,0.0032279,-0.00303495,0.01617195,-0.00661449,0.0043243,-0.00028808,-0.03768167,-0.01485916,-0.01589785,0.04584699,-0.01082699,-0.00105944,0.02191365,0.02971831,0.01446964,0.04951128,0.00893713,-0.02060085,0.03886463,-0.00291232,-0.0166336,-0.01158437,0.03759511,-0.02577991,-0.02322645,-0.03107439,-0.01007682,0.04449091,0.01327226,0.01996609,-0.02624156,-0.0072781,0.00340643,-0.00965124,0.01713852,-0.00088001,-0.03101669,-0.01771558,0.02162512,-0.00185739,-0.015869,-0.02259169,0.00725285,0.01403685,-0.00247592,0.0066217,0.0153785,-0.00735023,-0.01320012,-0.00382659,-0.01881198,0.00731777,0.00177715,-0.00947812,-0.01816279,-0.00194215,-0.01918706,0.02592418,0.06243731,0.00183485,-0.03473869,0.03468098,-0.04408697,0.02377465,0.04778012,-0.02717927,0.00718072,-0.00532333,0.00659646,-0.01491686,0.01125256,-0.00843221,0.01774443,-0.01271684,-0.0096296,-0.02427957,-0.04010529,0.02075954,-0.03309408,-0.02048544,-0.03323834,-0.01506113,0.01989396,0.00944927,0.02501532,-0.00911746,-0.01253651,0.0293288,0.00603022,0.02918454,0.02517401,0.00578497,-0.01930248,0.00014032,-0.01823493,-0.04036497,-0.03012225,-0.00531251,-0.00858369,0.01123814,-0.00045759,0.01051682,0.01618638,-0.01771558,0.03283441,-0.00241822,-0.00748728,0.01687885,0.0064017,0.01979297,-0.01497457,-0.02224546,0.03834528,0.01899952,-0.00513579,-0.00755942,-0.00685974,-0.01112994,0.04521223,0.03667182,0.02448154,-0.03248817,0.0729397,0.02554909,-0.00972337,-0.00077857,-0.01234176,0.05718611,0.02289464,0.02575106,-0.00212609,0.05415658,0.01785984,0.00436398,-0.01592671,-0.06826556,0.00824467,-0.03127636,0.01304143,0.040163,0.02603959,0.00663613,0.01230569,-0.00496628,-0.03511377,-0.01122371,0.02032675,-0.05060769,-0.00544595,-0.00538825,-0.00973058,-0.040163,-0.03410393,0.02363039,-0.00138493,0.02950192,-0.02638582,-0.01798968,-0.026155,-0.01474375,-0.00409709,0.00042197,-0.03346917,-0.02107692,-0.03156489,-0.02966061,-0.01199552,-0.03139177,0.01999494,0.01777328,-0.01755689,0.00643416,0.00657121,0.04480829,0.03309408,0.02475564,-0.00396364,0.01735492,-0.00429545,0.02295235,0.01265192,0.02433728,-0.01966313,0.00107116,-0.00841057,-0.00819418,0.03502721,-0.02331301,0.03716232,0.01205323,-0.03973021,0.01760017,-0.00665055,-0.01703754,-0.03799905,-0.00132723,-0.01206044,0.03494066,0.02104807,0.00625744,0.0090309]'::vector))"
+                                                          ],
+                                                          "Sort Key": [
+                                                            "((ds_2.embedding <=> '[-0.02739567,0.00839614,0.00670465,0.01350308,0.00338479,0.01003354,0.01068994,0.05020375,-0.00538103,0.02836223,-0.03771052,0.04189416,-0.02859306,-0.01126699,-0.0153208,-0.0306416,0.01226241,0.01830706,0.02293792,0.06653439,0.03707576,-0.02266382,-0.03052619,-0.01683557,-0.01725393,0.03378655,-0.02820354,0.05314673,0.0248422,-0.01427489,0.02928552,-0.03193997,0.0036102,-0.0202979,0.04483714,0.01888411,0.00082591,0.02554909,0.01683557,-0.00223969,-0.02440941,-0.00210445,-0.01774443,0.04431779,-0.00021392,-0.01141847,-0.00931222,0.03026651,0.01194503,0.01097125,0.03058389,-0.00309626,-0.00884336,0.0327767,-0.04847259,0.00123345,-0.00676957,0.03087242,0.01982182,-0.04397156,-0.02899699,0.02100479,0.01700868,0.00914632,-0.01389259,0.01899952,-0.03297867,0.00182403,-0.0176723,0.00400332,-0.04734733,0.02449597,-0.02723698,-0.04068235,0.0380856,-0.00145887,-0.02879502,-0.04076891,0.00281855,-0.0182205,0.00779024,0.04720307,-0.02537598,0.04348106,0.00108108,-0.05326214,-0.00656039,0.03211309,-0.01322176,0.00695351,0.03133406,0.01637392,-0.02101921,0.03323834,-0.01190175,-0.0151044,-0.01879755,0.00564071,-0.01654704,0.00407184,-0.00970894,-0.05409887,-0.04763586,0.07195871,0.0014778,-0.01585457,-0.07992207,-0.00644137,-0.01523424,0.03283441,0.00274462,-0.03237276,0.01366177,0.05098277,0.02290907,0.03211309,0.05585888,-0.02423629,0.03883578,-0.04780897,-0.00038072,0.026155,0.02272153,0.00160313,0.00857647,0.02311104,-0.0282324,0.03987447,-0.00719876,-0.06197567,0.01207487,-0.0216684,-0.03938398,-0.03638329,0.00267068,0.01628737,-0.00337216,0.02785731,-0.00336134,-0.00321528,0.06053303,0.03546001,0.03017996,-0.02195693,0.01605654,-0.01667688,0.0083168,0.01884083,-0.0075522,0.03266129,-0.00799942,-0.0271937,-0.03470983,0.01884083,-0.02478449,-0.00624301,0.0012028,0.00294118,-0.02234644,0.01207487,-0.0290547,-0.08234569,0.0327767,0.01585457,0.0211202,-0.0327767,-0.01611425,0.031738,-0.04172105,0.00719876,-0.00441807,-0.04111514,-0.0016437,0.0538969,0.00097739,5.957e-05,-0.02518843,-0.0496844,-0.0123129,0.03090127,0.02204349,0.09607959,-0.00048599,0.01272405,-0.0062358,-0.03459442,0.02026904,0.00623219,0.03450786,0.01189454,-0.01219028,0.00448299,0.0486457,-0.00038613,0.01212536,-0.02213004,0.03017996,0.028016,-0.03814331,0.04480829,-0.01529195,-0.02699173,0.02762649,-0.00292855,-0.0146644,0.00025607,-0.02446711,0.05776317,-0.02341399,0.00050312,0.04379844,-0.00468136,-0.01395751,0.01459227,-0.00724204,-0.0101778,0.0322862,0.0039961,-0.02156742,0.04423124,-0.01418833,-0.02155299,0.03646985,0.02523171,-0.02625598,0.01964871,-0.03915315,-0.05808055,-0.01592671,0.00713384,0.03872036,-0.01516211,-0.02110577,-0.01514768,-0.04330795,0.01514768,-0.00217297,-0.02339956,-0.0338731,-0.01892739,-0.01195946,0.03892233,-0.02821797,-0.01294766,-0.00905254,-0.00636924,0.03805675,0.00888664,-0.00736105,-0.01019944,0.01024272,-0.02598188,-0.05606085,-0.0306416,0.03970136,-0.00063927,-0.02798715,0.01807624,-0.01268077,-0.01540736,0.00214412,-0.04503911,-0.00785516,-0.02071626,0.00319544,0.01093518,-0.00706171,-0.00346593,0.03032422,-0.00934828,0.01885526,-0.00698597,0.00419447,-0.00513579,0.00311068,-0.02376022,0.00423053,0.00055992,-0.02997799,0.0322862,0.01550834,-0.04024956,0.02667435,-0.04570273,-0.01329389,-0.01516211,0.00404299,-0.01444079,0.06359141,0.01063223,0.05828251,0.01589785,-0.02289464,-0.05796513,-0.03635444,0.01344537,-0.0171818,0.00418365,-0.02191365,-0.0480975,0.01487358,0.01472211,-0.0565225,0.0291124,0.01397193,-0.00237494,-0.00620334,-0.02283693,0.01386374,0.04004759,-0.05135786,-0.00332708,0.02531827,0.01462833,0.03142062,-0.04215384,-0.04342336,0.05294476,0.01332275,0.02915568,0.00401774,-0.00957189,0.02896814,0.03442131,0.00710859,-0.02452482,-0.0306416,-0.02305333,0.04131711,0.00609153,-0.05251197,-0.01951887,0.02634254,0.05233885,-0.00135067,-0.00512497,0.036441,-0.01081256,-0.07178559,0.03646985,-0.01897067,-0.06047532,-0.00756663,-0.00882894,-0.06174484,-0.00491218,0.03817216,0.01200995,0.03782593,0.00368413,0.03283441,0.01987953,0.00266347,0.02119233,-0.02022576,-0.03006454,0.02217332,0.00911025,-0.07322823,0.02465466,0.0001588,0.01002632,0.04010529,0.02543368,-0.00086062,0.00165993,-0.05704185,-0.00999747,0.04463517,4.615e-05,-0.02994913,0.01742705,-0.01715295,-0.05083851,0.02611172,0.0443755,0.03248817,0.01024272,0.01845132,0.0240776,0.00471742,0.06716915,-0.00937714,0.00666859,-0.01052403,0.01556605,-0.0443755,-0.01656147,0.0209038,-0.04042267,0.04431779,-0.00765319,-0.0053053,0.01811951,0.03280555,0.00630793,0.00551087,0.03214194,-0.00955025,0.01568146,-0.02370252,-0.02175496,-0.02847764,0.01807624,0.00517906,-0.00150846,-0.0264291,-0.0287806,0.02191365,-0.07172789,0.00339741,-0.05519527,0.04024956,0.03929742,-0.02873732,0.03020881,-0.04451976,0.00226494,-0.01771558,-0.00999747,-0.00389151,0.02003822,0.00074792,-0.00311429,-0.02673205,0.05216574,0.04241351,-0.03557542,-0.02534712,-0.03072816,0.0380279,-0.04094202,-0.05646479,0.04241351,0.04033612,0.01773,-0.01221913,0.00898041,0.04097088,0.02968946,0.0193169,0.02237529,0.03367114,-0.02673205,0.01219028,0.01545064,0.0544451,0.01128863,-0.03768167,-0.03072816,-0.00148411,0.03476754,-0.0834998,-0.06261043,-0.00595809,0.0269196,-0.01830706,0.01719623,0.02781403,-0.02455367,0.01998052,0.02755436,-0.04550076,-0.06047532,-0.00692826,-0.01372669,0.03667182,0.04143252,0.00243986,-0.00479316,0.03237276,-0.0090814,0.02073069,-0.01168536,-0.01940346,0.02628484,0.02339956,0.01251487,0.03193997,-0.00663252,-0.01169978,0.00069201,-0.06324518,0.00823745,-0.01791755,0.05233885,0.0491362,0.00139305,-0.04273089,-0.00404299,-0.01397193,-0.02078839,0.001641,-0.0173982,0.03952824,-0.04708765,-0.05966745,0.01575359,0.04391386,-0.01221192,0.01235618,-0.03687379,-0.05005949,-0.05216574,0.06151402,-0.00495546,0.01160601,0.00053423,0.05764775,-0.01144011,-0.02950192,-0.01216864,-0.01172864,0.00312331,-0.01897067,0.03560427,-0.07097772,0.00916796,0.01015616,-0.03646985,-0.01077649,-0.00797778,-0.06076385,-0.02109135,0.02495761,-0.02803043,0.01423882,-0.08373062,-0.01839362,-0.0190428,0.01212536,-0.02500089,0.00682728,-0.02344284,0.00924009,0.03797019,0.0030638,-9.732e-05,-0.00957911,0.00146698,-0.01493129,0.01239225,0.00112345,-0.02200021,-0.02331301,0.03046848,-0.02798715,0.0012055,-0.01048075,0.02137987,-0.00694269,-0.04304827,-0.00249396,0.03586394,-7.72e-05,0.00752335,0.03592165,0.01949002,0.00516825,0.0264291,-0.01469325,-0.0333249,-0.00205936,-0.0282901,-0.00096927,0.01308471,-0.02849207,0.00058787,0.00730335,0.00350921,0.0010955,0.01517654,-0.03470983,-0.02896814,0.02065855,-0.01215421,0.05859989,-0.05989827,0.03156489,0.00012781,-0.0083168,-0.02794387,0.02250513,-0.00052025,-0.01087748,0.00828795,0.01787427,-0.01076207,0.00978829,0.0099614,0.01937461,0.01624409,0.01519096,-0.02231759,-0.01956215,0.00256789,-0.02485663,0.00031332,-0.01412341,0.01563818,-0.04954014,-0.00650268,0.01164929,-0.008865,-0.01731164,-0.0126375,-0.0110001,-0.00856926,-0.03825872,-0.03084357,-0.00204494,-0.00418725,0.02866519,0.00778302,0.00571645,-0.01141847,-0.0062899,-0.00469578,0.0272514,0.00145706,-0.02494318,-0.00566235,-0.02357268,-0.01783099,-0.0066758,0.03681608,-0.01289717,0.00597251,-0.01462112,-0.03179571,-0.00932665,-0.00758827,0.00928337,0.02351497,-0.03468098,-0.00658203,-0.00184477,-0.00931222,0.02559237,-0.00592202,0.00709056,0.0119306,-0.00199805,-0.03791249,0.01432538,0.00786958,-0.0108342,-0.02207234,0.03315179,0.01488801,0.02648681,0.01103617,0.02526057,0.01195224,-0.03196882,-0.01592671,-0.00405381,-0.00411151,-0.02426515,0.0285642,0.00583186,-0.01446243,0.00522234,0.00094493,-0.03900889,0.05164639,-0.01582572,-0.03121865,0.00397446,-0.0142821,0.06884261,0.03750855,0.05098277,-0.02086052,0.03724888,-0.01888411,0.0128034,-0.05738808,-0.00614563,-0.0009003,-0.05386805,0.00367512,-0.04102858,-0.00753778,-0.01321455,-0.01873985,-0.00798499,0.01308471,-0.05819596,-0.0049807,-0.03185342,0.03921086,0.0169077,-0.01666245,-0.00428102,-0.01599884,0.0007912,0.00267789,-0.00299527,0.01924477,0.00655678,0.02769862,-0.02892486,-0.05130015,-0.01836476,0.03805675,0.03667182,0.02583762,0.04876111,0.01315685,0.00117575,0.0322285,-0.0180041,0.05052113,-0.02006707,0.01081977,-0.00622858,0.03006454,-0.01571031,0.03191112,0.04397156,0.02803043,-0.02712157,0.03352687,-0.01679229,0.0080427,-0.03306523,-0.02096151,-0.02798715,-0.02032675,-0.00934828,0.02451039,0.00340462,0.01591228,-0.01507555,0.03170915,-0.02745337,-0.02667435,0.02775633,0.02156742,0.00608793,0.0256645,-0.02717927,-0.02195693,-0.01330832,0.03274785,0.03026651,-0.04659716,-0.01178634,0.01405849,0.02678976,0.01263028,0.01878313,-0.00043054,-0.0062394,-0.04226925,-0.00792729,-0.01858116,-0.0218848,0.00478955,0.02645795,0.01579687,0.02443826,-0.0104519,-0.00957189,-0.01726836,-0.00162567,-0.00418725,-0.02060085,0.01761459,0.02449597,-0.02885273,0.00357413,0.02237529,0.01781656,-0.00864139,-0.02125004,0.01882641,0.00510333,0.02430842,-0.01476538,-0.05611856,-0.04610666,0.00789843,-0.02339956,-0.00374003,0.01239946,0.00041589,0.00907418,0.00335954,0.01752803,0.01189454,-0.01595556,0.02308218,0.04593354,0.02844879,0.00956468,-0.02761206,-0.02452482,-0.00547481,0.03165144,0.01323619,-6.689e-05,-0.02047101,-0.00587514,0.03280555,-0.00108739,0.0089732,-0.00817254,0.02012478,-0.02099036,0.00799221,0.00476431,-0.00645219,-0.0174559,-0.01234176,-0.0240199,-0.02204349,0.00193313,-0.00451185,0.04985752,-0.02935765,0.00278429,-0.00368774,-0.00735745,0.00556858,0.01609982,0.0133516,-0.01473653,-0.01167814,0.0174559,-0.01529195,-0.00367512,-0.00383741,-0.03179571,0.02426515,0.01160601,-0.00729253,-0.02644353,0.03084357,0.04013415,0.03883578,-0.01023551,-0.00378331,-0.0010946,-0.06001368,-0.01706639,0.02189922,-0.00604825,0.02771305,-0.02403432,-0.03482524,0.03341146,0.02830453,-0.00539907,0.01014173,-0.00440365,-0.00133173,0.01236339,-0.03156489,-0.02322645,0.03020881,0.00810762,-0.04183646,0.01115158,0.01038698,-0.00780466,0.00445414,0.01212536,0.0203556,0.00217477,-0.00085116,-0.00655318,-0.01920149,-0.01788869,0.00236412,-0.02787174,0.00107837,-0.01113715,-0.04050923,0.04042267,0.02752551,0.03170915,-0.02590975,-0.0267032,-0.04400041,-0.01160601,0.05585888,0.02132217,0.00846828,-0.00974501,0.01424604,-0.0088073,-0.07778696,0.01304143,-0.04114399,-0.00112255,0.02974716,0.01428931,-0.03569083,-0.01516211,0.01434702,0.01254372,-0.0123129,0.02039888,0.02179824,-0.02944421,0.01392866,0.01768672,0.03185342,-0.04483714,0.00508529,-0.00992534,-0.0039925,0.02957405,0.04653945,-0.01244274,0.00647022,0.03822987,-0.04639519,0.00406102,-0.01086305,0.02817469,-0.01667688,-0.01507555,0.02787174,-0.04368303,0.02609729,-0.00713384,-0.01021387,0.01011288,0.02468351,-0.01622966,0.01365455,0.01757131,-0.01289717,0.01930248,0.03563312,0.02364481,-0.00883615,0.02078839,0.03000684,-0.03211309,0.00504562,0.01571031,0.01372669,0.01637392,0.0385761,0.00113608,-0.0369892,0.05519527,-0.01208208,0.03193997,-0.03090127,0.01601326,-0.03776822,0.01192339,0.00222166,0.00015982,0.04362533,-0.00320085,0.03078586,-0.02054314,0.00621055,0.00477152,0.04420238,-0.0104519,0.001861,0.0333249,-0.01071879,-0.03424819,-0.03121865,0.02627041,0.02096151,0.02495761,0.00896599,-0.02106249,-0.02583762,0.01987953,0.0025156,0.00844664,0.04884767,-0.00745843,0.00402856,0.02087495,-0.03361343,0.0412017,-0.01868214,-0.01716737,0.01012731,-0.01684999,-0.0496267,-0.00290511,0.0327767,-0.00827352,0.02608287,-0.00027523,0.0027356,-0.0045407,0.01819165,-0.00595448,-0.0090309,0.02455367,0.01294766,-0.01407292,-0.00412233,0.0056912,-0.01686442,0.01920149,0.00644137,-0.01085584,-0.00078984,0.00753056,-0.00991813,-0.0338731,-0.02445269,0.02635697,-0.0354023,-0.01419554,0.00166534,-0.04578928,0.01631622,-0.00385905,0.0144985,-0.00122624,-0.04123055,0.03061275,-0.04933817,0.02651566,0.01640278,0.01758574,-0.02650123,0.0013119,0.01462112,0.02524614,0.00709416,-0.02702058,0.0031197,-0.01224798,-0.01599884,0.0013137,0.00571284,0.02211562,0.0049771,-0.02487105,0.0250586,-0.03603706,0.00160583,0.00914632,0.0093555,0.00630432,-0.02831895,0.0155949,-0.03355572,0.0343636,-0.0180041,0.0402207,0.0013146,0.02950192,0.01211815,-0.00016557,0.0014219,-0.01116601,-0.02678976,0.01615753,-0.01381324,0.01129584,0.00490136,-0.0021333,0.0085909,0.00635121,-0.00943484,-0.00173928,0.04671257,-0.01527752,-0.0311898,0.00367151,0.00748728,-0.00848992,0.0184946,0.01116601,0.02381793,0.01888411,0.0517618,-0.05960974,-0.04062464,0.04024956,0.01622966,0.00658924,-0.00989649,-0.04835717,0.0192592,-0.01643163,-0.00769647,-0.00695711,-0.02334186,0.00810762,0.01467883,0.01374833,0.01137519,0.01736934,0.01000468,0.0433368,0.00380135,-0.02182709,-0.00964403,0.00513218,-0.01292602,0.01218307,0.00728892,0.0126375,-0.0182205,0.03355572,-0.01119486,-0.02123561,-0.01858116,-0.00770368,-0.04013415,-0.02250513,0.00556497,-0.02472679,-0.02109135,-0.0006307,0.01879755,0.01163486,-0.0034479,0.02632812,0.00126952,0.00338118,-0.0237458,-0.01703754,0.01936018,0.03494066,0.00216576,-0.00287085,0.00856205,0.00561186,-0.02762649,0.00440365,0.01036534,0.01107945,-0.00334692,-0.01063223,-0.007224,0.01514768,0.01917264,-0.00580301,0.11114071,-0.01381324,-0.02676091,-0.0083745,0.00078083,-0.04613551,-0.01892739,0.03854725,0.00212068,0.05132901,-0.00677679,-0.01030042,0.00788401,0.00159952,0.02709271,0.03903774,0.01172864,-0.01604212,-0.00442168,-0.03147833,0.00759548,-0.01722508,0.02803043,0.02198578,0.01744148,-0.00038681,0.00167346,-0.04293286,-0.02110577,-0.02827568,-0.01293324,0.00800663,-0.01814837,0.00628268,0.02210119,-0.00385905,-0.01354636,-0.03996103,-0.0113247,0.01814837,0.00769647,0.01353193,-0.01602769,-0.03629673,0.00463086,0.01040141,0.01705196,0.0138998,0.00739351,0.03693149,-0.00063341,0.01571031,-0.00582825,0.02397662,0.01560933,-0.01843689,-0.00943484,0.00148321,0.00892992,-0.00491939,0.0088073,-0.0198074,0.01853788,0.01640278,-0.01199552,0.01396472,-0.01177913,-0.02237529,0.00607711,0.0129116,0.01247159,0.0332672,0.00732138,-0.04345221,0.01420276,-0.01572474,0.047607,0.00954304,-0.05822481,-0.00717712,0.02513073,0.00414397,0.01382046,-0.0322862,-0.00420529,0.01832148,-0.04509682,-0.02891044,-0.00790565,0.01150503,0.02504417,-0.01761459,-0.00277708,-0.00720597,-0.01084141,-0.01221192,0.00064062,-0.04212499,0.01842247,0.01797525,-0.02997799,-0.05170409,-0.02704943,0.00695351,-0.0012064,-0.02492876,-0.00082005,-0.00302954,0.00424496,-0.03791249,-0.00192231,-0.00467414,-0.00275724,-0.0465683,0.02384678,0.02376022,-0.03773937,-0.01521982,0.00650629,0.04019185,0.00786237,-0.03889348,0.01933133,-0.02573664,0.02184152,0.01442636,-0.0166336,0.03681608,-0.03147833,-0.01245717,0.02091823,-0.00993977,0.02585205,-0.01855231,0.02259169,0.01498899,0.02162512,-0.01332275,0.00792729,-0.02329858,0.01983625,0.02233201,0.00870631,-0.01005518,0.00623219,-0.0101778,0.0332672,0.00215133,0.00526562,-0.03185342,-0.00949976,-0.01643163,0.00243806,-0.01372669,-0.00757384,0.02608287,-0.03364228,0.01413784,-0.01009846,0.01974969,-0.0085909,0.02755436,-0.04019185,-0.0010414,0.00586792,-0.00311609,0.00024728,0.04576043,-0.01357521,0.00905254,0.01941789,-0.01206765,-0.02049986,0.00024412,-0.00235871,0.01369062,-0.01078371,0.01744148,-0.01732606,0.01643163,0.00982435,-0.01917264,0.02064413,0.02351497,-0.03199768,0.02833338,-0.00440004,-0.01401521,0.0032279,-0.00303495,0.01617195,-0.00661449,0.0043243,-0.00028808,-0.03768167,-0.01485916,-0.01589785,0.04584699,-0.01082699,-0.00105944,0.02191365,0.02971831,0.01446964,0.04951128,0.00893713,-0.02060085,0.03886463,-0.00291232,-0.0166336,-0.01158437,0.03759511,-0.02577991,-0.02322645,-0.03107439,-0.01007682,0.04449091,0.01327226,0.01996609,-0.02624156,-0.0072781,0.00340643,-0.00965124,0.01713852,-0.00088001,-0.03101669,-0.01771558,0.02162512,-0.00185739,-0.015869,-0.02259169,0.00725285,0.01403685,-0.00247592,0.0066217,0.0153785,-0.00735023,-0.01320012,-0.00382659,-0.01881198,0.00731777,0.00177715,-0.00947812,-0.01816279,-0.00194215,-0.01918706,0.02592418,0.06243731,0.00183485,-0.03473869,0.03468098,-0.04408697,0.02377465,0.04778012,-0.02717927,0.00718072,-0.00532333,0.00659646,-0.01491686,0.01125256,-0.00843221,0.01774443,-0.01271684,-0.0096296,-0.02427957,-0.04010529,0.02075954,-0.03309408,-0.02048544,-0.03323834,-0.01506113,0.01989396,0.00944927,0.02501532,-0.00911746,-0.01253651,0.0293288,0.00603022,0.02918454,0.02517401,0.00578497,-0.01930248,0.00014032,-0.01823493,-0.04036497,-0.03012225,-0.00531251,-0.00858369,0.01123814,-0.00045759,0.01051682,0.01618638,-0.01771558,0.03283441,-0.00241822,-0.00748728,0.01687885,0.0064017,0.01979297,-0.01497457,-0.02224546,0.03834528,0.01899952,-0.00513579,-0.00755942,-0.00685974,-0.01112994,0.04521223,0.03667182,0.02448154,-0.03248817,0.0729397,0.02554909,-0.00972337,-0.00077857,-0.01234176,0.05718611,0.02289464,0.02575106,-0.00212609,0.05415658,0.01785984,0.00436398,-0.01592671,-0.06826556,0.00824467,-0.03127636,0.01304143,0.040163,0.02603959,0.00663613,0.01230569,-0.00496628,-0.03511377,-0.01122371,0.02032675,-0.05060769,-0.00544595,-0.00538825,-0.00973058,-0.040163,-0.03410393,0.02363039,-0.00138493,0.02950192,-0.02638582,-0.01798968,-0.026155,-0.01474375,-0.00409709,0.00042197,-0.03346917,-0.02107692,-0.03156489,-0.02966061,-0.01199552,-0.03139177,0.01999494,0.01777328,-0.01755689,0.00643416,0.00657121,0.04480829,0.03309408,0.02475564,-0.00396364,0.01735492,-0.00429545,0.02295235,0.01265192,0.02433728,-0.01966313,0.00107116,-0.00841057,-0.00819418,0.03502721,-0.02331301,0.03716232,0.01205323,-0.03973021,0.01760017,-0.00665055,-0.01703754,-0.03799905,-0.00132723,-0.01206044,0.03494066,0.02104807,0.00625744,0.0090309]'::vector))"
+                                                          ],
+                                                          "Shared Hit Blocks": 0,
+                                                          "Shared Read Blocks": 0,
+                                                          "Shared Dirtied Blocks": 0,
+                                                          "Shared Written Blocks": 0,
+                                                          "Local Hit Blocks": 0,
+                                                          "Local Read Blocks": 0,
+                                                          "Local Dirtied Blocks": 0,
+                                                          "Local Written Blocks": 0,
+                                                          "Temp Read Blocks": 0,
+                                                          "Temp Written Blocks": 0,
+                                                          "Plans": [
+                                                            {
+                                                              "Node Type": "Seq Scan",
+                                                              "Parent Relationship": "Outer",
+                                                              "Parallel Aware": false,
+                                                              "Async Capable": false,
+                                                              "Relation Name": "document_segments",
+                                                              "Schema": "public",
+                                                              "Alias": "ds_2",
+                                                              "Startup Cost": 0,
+                                                              "Total Cost": 5535.75,
+                                                              "Plan Rows": 6191,
+                                                              "Plan Width": 24,
+                                                              "Disabled": false,
+                                                              "Output": [
+                                                                "ds_2.id",
+                                                                "(ds_2.embedding <=> '[-0.02739567,0.00839614,0.00670465,0.01350308,0.00338479,0.01003354,0.01068994,0.05020375,-0.00538103,0.02836223,-0.03771052,0.04189416,-0.02859306,-0.01126699,-0.0153208,-0.0306416,0.01226241,0.01830706,0.02293792,0.06653439,0.03707576,-0.02266382,-0.03052619,-0.01683557,-0.01725393,0.03378655,-0.02820354,0.05314673,0.0248422,-0.01427489,0.02928552,-0.03193997,0.0036102,-0.0202979,0.04483714,0.01888411,0.00082591,0.02554909,0.01683557,-0.00223969,-0.02440941,-0.00210445,-0.01774443,0.04431779,-0.00021392,-0.01141847,-0.00931222,0.03026651,0.01194503,0.01097125,0.03058389,-0.00309626,-0.00884336,0.0327767,-0.04847259,0.00123345,-0.00676957,0.03087242,0.01982182,-0.04397156,-0.02899699,0.02100479,0.01700868,0.00914632,-0.01389259,0.01899952,-0.03297867,0.00182403,-0.0176723,0.00400332,-0.04734733,0.02449597,-0.02723698,-0.04068235,0.0380856,-0.00145887,-0.02879502,-0.04076891,0.00281855,-0.0182205,0.00779024,0.04720307,-0.02537598,0.04348106,0.00108108,-0.05326214,-0.00656039,0.03211309,-0.01322176,0.00695351,0.03133406,0.01637392,-0.02101921,0.03323834,-0.01190175,-0.0151044,-0.01879755,0.00564071,-0.01654704,0.00407184,-0.00970894,-0.05409887,-0.04763586,0.07195871,0.0014778,-0.01585457,-0.07992207,-0.00644137,-0.01523424,0.03283441,0.00274462,-0.03237276,0.01366177,0.05098277,0.02290907,0.03211309,0.05585888,-0.02423629,0.03883578,-0.04780897,-0.00038072,0.026155,0.02272153,0.00160313,0.00857647,0.02311104,-0.0282324,0.03987447,-0.00719876,-0.06197567,0.01207487,-0.0216684,-0.03938398,-0.03638329,0.00267068,0.01628737,-0.00337216,0.02785731,-0.00336134,-0.00321528,0.06053303,0.03546001,0.03017996,-0.02195693,0.01605654,-0.01667688,0.0083168,0.01884083,-0.0075522,0.03266129,-0.00799942,-0.0271937,-0.03470983,0.01884083,-0.02478449,-0.00624301,0.0012028,0.00294118,-0.02234644,0.01207487,-0.0290547,-0.08234569,0.0327767,0.01585457,0.0211202,-0.0327767,-0.01611425,0.031738,-0.04172105,0.00719876,-0.00441807,-0.04111514,-0.0016437,0.0538969,0.00097739,5.957e-05,-0.02518843,-0.0496844,-0.0123129,0.03090127,0.02204349,0.09607959,-0.00048599,0.01272405,-0.0062358,-0.03459442,0.02026904,0.00623219,0.03450786,0.01189454,-0.01219028,0.00448299,0.0486457,-0.00038613,0.01212536,-0.02213004,0.03017996,0.028016,-0.03814331,0.04480829,-0.01529195,-0.02699173,0.02762649,-0.00292855,-0.0146644,0.00025607,-0.02446711,0.05776317,-0.02341399,0.00050312,0.04379844,-0.00468136,-0.01395751,0.01459227,-0.00724204,-0.0101778,0.0322862,0.0039961,-0.02156742,0.04423124,-0.01418833,-0.02155299,0.03646985,0.02523171,-0.02625598,0.01964871,-0.03915315,-0.05808055,-0.01592671,0.00713384,0.03872036,-0.01516211,-0.02110577,-0.01514768,-0.04330795,0.01514768,-0.00217297,-0.02339956,-0.0338731,-0.01892739,-0.01195946,0.03892233,-0.02821797,-0.01294766,-0.00905254,-0.00636924,0.03805675,0.00888664,-0.00736105,-0.01019944,0.01024272,-0.02598188,-0.05606085,-0.0306416,0.03970136,-0.00063927,-0.02798715,0.01807624,-0.01268077,-0.01540736,0.00214412,-0.04503911,-0.00785516,-0.02071626,0.00319544,0.01093518,-0.00706171,-0.00346593,0.03032422,-0.00934828,0.01885526,-0.00698597,0.00419447,-0.00513579,0.00311068,-0.02376022,0.00423053,0.00055992,-0.02997799,0.0322862,0.01550834,-0.04024956,0.02667435,-0.04570273,-0.01329389,-0.01516211,0.00404299,-0.01444079,0.06359141,0.01063223,0.05828251,0.01589785,-0.02289464,-0.05796513,-0.03635444,0.01344537,-0.0171818,0.00418365,-0.02191365,-0.0480975,0.01487358,0.01472211,-0.0565225,0.0291124,0.01397193,-0.00237494,-0.00620334,-0.02283693,0.01386374,0.04004759,-0.05135786,-0.00332708,0.02531827,0.01462833,0.03142062,-0.04215384,-0.04342336,0.05294476,0.01332275,0.02915568,0.00401774,-0.00957189,0.02896814,0.03442131,0.00710859,-0.02452482,-0.0306416,-0.02305333,0.04131711,0.00609153,-0.05251197,-0.01951887,0.02634254,0.05233885,-0.00135067,-0.00512497,0.036441,-0.01081256,-0.07178559,0.03646985,-0.01897067,-0.06047532,-0.00756663,-0.00882894,-0.06174484,-0.00491218,0.03817216,0.01200995,0.03782593,0.00368413,0.03283441,0.01987953,0.00266347,0.02119233,-0.02022576,-0.03006454,0.02217332,0.00911025,-0.07322823,0.02465466,0.0001588,0.01002632,0.04010529,0.02543368,-0.00086062,0.00165993,-0.05704185,-0.00999747,0.04463517,4.615e-05,-0.02994913,0.01742705,-0.01715295,-0.05083851,0.02611172,0.0443755,0.03248817,0.01024272,0.01845132,0.0240776,0.00471742,0.06716915,-0.00937714,0.00666859,-0.01052403,0.01556605,-0.0443755,-0.01656147,0.0209038,-0.04042267,0.04431779,-0.00765319,-0.0053053,0.01811951,0.03280555,0.00630793,0.00551087,0.03214194,-0.00955025,0.01568146,-0.02370252,-0.02175496,-0.02847764,0.01807624,0.00517906,-0.00150846,-0.0264291,-0.0287806,0.02191365,-0.07172789,0.00339741,-0.05519527,0.04024956,0.03929742,-0.02873732,0.03020881,-0.04451976,0.00226494,-0.01771558,-0.00999747,-0.00389151,0.02003822,0.00074792,-0.00311429,-0.02673205,0.05216574,0.04241351,-0.03557542,-0.02534712,-0.03072816,0.0380279,-0.04094202,-0.05646479,0.04241351,0.04033612,0.01773,-0.01221913,0.00898041,0.04097088,0.02968946,0.0193169,0.02237529,0.03367114,-0.02673205,0.01219028,0.01545064,0.0544451,0.01128863,-0.03768167,-0.03072816,-0.00148411,0.03476754,-0.0834998,-0.06261043,-0.00595809,0.0269196,-0.01830706,0.01719623,0.02781403,-0.02455367,0.01998052,0.02755436,-0.04550076,-0.06047532,-0.00692826,-0.01372669,0.03667182,0.04143252,0.00243986,-0.00479316,0.03237276,-0.0090814,0.02073069,-0.01168536,-0.01940346,0.02628484,0.02339956,0.01251487,0.03193997,-0.00663252,-0.01169978,0.00069201,-0.06324518,0.00823745,-0.01791755,0.05233885,0.0491362,0.00139305,-0.04273089,-0.00404299,-0.01397193,-0.02078839,0.001641,-0.0173982,0.03952824,-0.04708765,-0.05966745,0.01575359,0.04391386,-0.01221192,0.01235618,-0.03687379,-0.05005949,-0.05216574,0.06151402,-0.00495546,0.01160601,0.00053423,0.05764775,-0.01144011,-0.02950192,-0.01216864,-0.01172864,0.00312331,-0.01897067,0.03560427,-0.07097772,0.00916796,0.01015616,-0.03646985,-0.01077649,-0.00797778,-0.06076385,-0.02109135,0.02495761,-0.02803043,0.01423882,-0.08373062,-0.01839362,-0.0190428,0.01212536,-0.02500089,0.00682728,-0.02344284,0.00924009,0.03797019,0.0030638,-9.732e-05,-0.00957911,0.00146698,-0.01493129,0.01239225,0.00112345,-0.02200021,-0.02331301,0.03046848,-0.02798715,0.0012055,-0.01048075,0.02137987,-0.00694269,-0.04304827,-0.00249396,0.03586394,-7.72e-05,0.00752335,0.03592165,0.01949002,0.00516825,0.0264291,-0.01469325,-0.0333249,-0.00205936,-0.0282901,-0.00096927,0.01308471,-0.02849207,0.00058787,0.00730335,0.00350921,0.0010955,0.01517654,-0.03470983,-0.02896814,0.02065855,-0.01215421,0.05859989,-0.05989827,0.03156489,0.00012781,-0.0083168,-0.02794387,0.02250513,-0.00052025,-0.01087748,0.00828795,0.01787427,-0.01076207,0.00978829,0.0099614,0.01937461,0.01624409,0.01519096,-0.02231759,-0.01956215,0.00256789,-0.02485663,0.00031332,-0.01412341,0.01563818,-0.04954014,-0.00650268,0.01164929,-0.008865,-0.01731164,-0.0126375,-0.0110001,-0.00856926,-0.03825872,-0.03084357,-0.00204494,-0.00418725,0.02866519,0.00778302,0.00571645,-0.01141847,-0.0062899,-0.00469578,0.0272514,0.00145706,-0.02494318,-0.00566235,-0.02357268,-0.01783099,-0.0066758,0.03681608,-0.01289717,0.00597251,-0.01462112,-0.03179571,-0.00932665,-0.00758827,0.00928337,0.02351497,-0.03468098,-0.00658203,-0.00184477,-0.00931222,0.02559237,-0.00592202,0.00709056,0.0119306,-0.00199805,-0.03791249,0.01432538,0.00786958,-0.0108342,-0.02207234,0.03315179,0.01488801,0.02648681,0.01103617,0.02526057,0.01195224,-0.03196882,-0.01592671,-0.00405381,-0.00411151,-0.02426515,0.0285642,0.00583186,-0.01446243,0.00522234,0.00094493,-0.03900889,0.05164639,-0.01582572,-0.03121865,0.00397446,-0.0142821,0.06884261,0.03750855,0.05098277,-0.02086052,0.03724888,-0.01888411,0.0128034,-0.05738808,-0.00614563,-0.0009003,-0.05386805,0.00367512,-0.04102858,-0.00753778,-0.01321455,-0.01873985,-0.00798499,0.01308471,-0.05819596,-0.0049807,-0.03185342,0.03921086,0.0169077,-0.01666245,-0.00428102,-0.01599884,0.0007912,0.00267789,-0.00299527,0.01924477,0.00655678,0.02769862,-0.02892486,-0.05130015,-0.01836476,0.03805675,0.03667182,0.02583762,0.04876111,0.01315685,0.00117575,0.0322285,-0.0180041,0.05052113,-0.02006707,0.01081977,-0.00622858,0.03006454,-0.01571031,0.03191112,0.04397156,0.02803043,-0.02712157,0.03352687,-0.01679229,0.0080427,-0.03306523,-0.02096151,-0.02798715,-0.02032675,-0.00934828,0.02451039,0.00340462,0.01591228,-0.01507555,0.03170915,-0.02745337,-0.02667435,0.02775633,0.02156742,0.00608793,0.0256645,-0.02717927,-0.02195693,-0.01330832,0.03274785,0.03026651,-0.04659716,-0.01178634,0.01405849,0.02678976,0.01263028,0.01878313,-0.00043054,-0.0062394,-0.04226925,-0.00792729,-0.01858116,-0.0218848,0.00478955,0.02645795,0.01579687,0.02443826,-0.0104519,-0.00957189,-0.01726836,-0.00162567,-0.00418725,-0.02060085,0.01761459,0.02449597,-0.02885273,0.00357413,0.02237529,0.01781656,-0.00864139,-0.02125004,0.01882641,0.00510333,0.02430842,-0.01476538,-0.05611856,-0.04610666,0.00789843,-0.02339956,-0.00374003,0.01239946,0.00041589,0.00907418,0.00335954,0.01752803,0.01189454,-0.01595556,0.02308218,0.04593354,0.02844879,0.00956468,-0.02761206,-0.02452482,-0.00547481,0.03165144,0.01323619,-6.689e-05,-0.02047101,-0.00587514,0.03280555,-0.00108739,0.0089732,-0.00817254,0.02012478,-0.02099036,0.00799221,0.00476431,-0.00645219,-0.0174559,-0.01234176,-0.0240199,-0.02204349,0.00193313,-0.00451185,0.04985752,-0.02935765,0.00278429,-0.00368774,-0.00735745,0.00556858,0.01609982,0.0133516,-0.01473653,-0.01167814,0.0174559,-0.01529195,-0.00367512,-0.00383741,-0.03179571,0.02426515,0.01160601,-0.00729253,-0.02644353,0.03084357,0.04013415,0.03883578,-0.01023551,-0.00378331,-0.0010946,-0.06001368,-0.01706639,0.02189922,-0.00604825,0.02771305,-0.02403432,-0.03482524,0.03341146,0.02830453,-0.00539907,0.01014173,-0.00440365,-0.00133173,0.01236339,-0.03156489,-0.02322645,0.03020881,0.00810762,-0.04183646,0.01115158,0.01038698,-0.00780466,0.00445414,0.01212536,0.0203556,0.00217477,-0.00085116,-0.00655318,-0.01920149,-0.01788869,0.00236412,-0.02787174,0.00107837,-0.01113715,-0.04050923,0.04042267,0.02752551,0.03170915,-0.02590975,-0.0267032,-0.04400041,-0.01160601,0.05585888,0.02132217,0.00846828,-0.00974501,0.01424604,-0.0088073,-0.07778696,0.01304143,-0.04114399,-0.00112255,0.02974716,0.01428931,-0.03569083,-0.01516211,0.01434702,0.01254372,-0.0123129,0.02039888,0.02179824,-0.02944421,0.01392866,0.01768672,0.03185342,-0.04483714,0.00508529,-0.00992534,-0.0039925,0.02957405,0.04653945,-0.01244274,0.00647022,0.03822987,-0.04639519,0.00406102,-0.01086305,0.02817469,-0.01667688,-0.01507555,0.02787174,-0.04368303,0.02609729,-0.00713384,-0.01021387,0.01011288,0.02468351,-0.01622966,0.01365455,0.01757131,-0.01289717,0.01930248,0.03563312,0.02364481,-0.00883615,0.02078839,0.03000684,-0.03211309,0.00504562,0.01571031,0.01372669,0.01637392,0.0385761,0.00113608,-0.0369892,0.05519527,-0.01208208,0.03193997,-0.03090127,0.01601326,-0.03776822,0.01192339,0.00222166,0.00015982,0.04362533,-0.00320085,0.03078586,-0.02054314,0.00621055,0.00477152,0.04420238,-0.0104519,0.001861,0.0333249,-0.01071879,-0.03424819,-0.03121865,0.02627041,0.02096151,0.02495761,0.00896599,-0.02106249,-0.02583762,0.01987953,0.0025156,0.00844664,0.04884767,-0.00745843,0.00402856,0.02087495,-0.03361343,0.0412017,-0.01868214,-0.01716737,0.01012731,-0.01684999,-0.0496267,-0.00290511,0.0327767,-0.00827352,0.02608287,-0.00027523,0.0027356,-0.0045407,0.01819165,-0.00595448,-0.0090309,0.02455367,0.01294766,-0.01407292,-0.00412233,0.0056912,-0.01686442,0.01920149,0.00644137,-0.01085584,-0.00078984,0.00753056,-0.00991813,-0.0338731,-0.02445269,0.02635697,-0.0354023,-0.01419554,0.00166534,-0.04578928,0.01631622,-0.00385905,0.0144985,-0.00122624,-0.04123055,0.03061275,-0.04933817,0.02651566,0.01640278,0.01758574,-0.02650123,0.0013119,0.01462112,0.02524614,0.00709416,-0.02702058,0.0031197,-0.01224798,-0.01599884,0.0013137,0.00571284,0.02211562,0.0049771,-0.02487105,0.0250586,-0.03603706,0.00160583,0.00914632,0.0093555,0.00630432,-0.02831895,0.0155949,-0.03355572,0.0343636,-0.0180041,0.0402207,0.0013146,0.02950192,0.01211815,-0.00016557,0.0014219,-0.01116601,-0.02678976,0.01615753,-0.01381324,0.01129584,0.00490136,-0.0021333,0.0085909,0.00635121,-0.00943484,-0.00173928,0.04671257,-0.01527752,-0.0311898,0.00367151,0.00748728,-0.00848992,0.0184946,0.01116601,0.02381793,0.01888411,0.0517618,-0.05960974,-0.04062464,0.04024956,0.01622966,0.00658924,-0.00989649,-0.04835717,0.0192592,-0.01643163,-0.00769647,-0.00695711,-0.02334186,0.00810762,0.01467883,0.01374833,0.01137519,0.01736934,0.01000468,0.0433368,0.00380135,-0.02182709,-0.00964403,0.00513218,-0.01292602,0.01218307,0.00728892,0.0126375,-0.0182205,0.03355572,-0.01119486,-0.02123561,-0.01858116,-0.00770368,-0.04013415,-0.02250513,0.00556497,-0.02472679,-0.02109135,-0.0006307,0.01879755,0.01163486,-0.0034479,0.02632812,0.00126952,0.00338118,-0.0237458,-0.01703754,0.01936018,0.03494066,0.00216576,-0.00287085,0.00856205,0.00561186,-0.02762649,0.00440365,0.01036534,0.01107945,-0.00334692,-0.01063223,-0.007224,0.01514768,0.01917264,-0.00580301,0.11114071,-0.01381324,-0.02676091,-0.0083745,0.00078083,-0.04613551,-0.01892739,0.03854725,0.00212068,0.05132901,-0.00677679,-0.01030042,0.00788401,0.00159952,0.02709271,0.03903774,0.01172864,-0.01604212,-0.00442168,-0.03147833,0.00759548,-0.01722508,0.02803043,0.02198578,0.01744148,-0.00038681,0.00167346,-0.04293286,-0.02110577,-0.02827568,-0.01293324,0.00800663,-0.01814837,0.00628268,0.02210119,-0.00385905,-0.01354636,-0.03996103,-0.0113247,0.01814837,0.00769647,0.01353193,-0.01602769,-0.03629673,0.00463086,0.01040141,0.01705196,0.0138998,0.00739351,0.03693149,-0.00063341,0.01571031,-0.00582825,0.02397662,0.01560933,-0.01843689,-0.00943484,0.00148321,0.00892992,-0.00491939,0.0088073,-0.0198074,0.01853788,0.01640278,-0.01199552,0.01396472,-0.01177913,-0.02237529,0.00607711,0.0129116,0.01247159,0.0332672,0.00732138,-0.04345221,0.01420276,-0.01572474,0.047607,0.00954304,-0.05822481,-0.00717712,0.02513073,0.00414397,0.01382046,-0.0322862,-0.00420529,0.01832148,-0.04509682,-0.02891044,-0.00790565,0.01150503,0.02504417,-0.01761459,-0.00277708,-0.00720597,-0.01084141,-0.01221192,0.00064062,-0.04212499,0.01842247,0.01797525,-0.02997799,-0.05170409,-0.02704943,0.00695351,-0.0012064,-0.02492876,-0.00082005,-0.00302954,0.00424496,-0.03791249,-0.00192231,-0.00467414,-0.00275724,-0.0465683,0.02384678,0.02376022,-0.03773937,-0.01521982,0.00650629,0.04019185,0.00786237,-0.03889348,0.01933133,-0.02573664,0.02184152,0.01442636,-0.0166336,0.03681608,-0.03147833,-0.01245717,0.02091823,-0.00993977,0.02585205,-0.01855231,0.02259169,0.01498899,0.02162512,-0.01332275,0.00792729,-0.02329858,0.01983625,0.02233201,0.00870631,-0.01005518,0.00623219,-0.0101778,0.0332672,0.00215133,0.00526562,-0.03185342,-0.00949976,-0.01643163,0.00243806,-0.01372669,-0.00757384,0.02608287,-0.03364228,0.01413784,-0.01009846,0.01974969,-0.0085909,0.02755436,-0.04019185,-0.0010414,0.00586792,-0.00311609,0.00024728,0.04576043,-0.01357521,0.00905254,0.01941789,-0.01206765,-0.02049986,0.00024412,-0.00235871,0.01369062,-0.01078371,0.01744148,-0.01732606,0.01643163,0.00982435,-0.01917264,0.02064413,0.02351497,-0.03199768,0.02833338,-0.00440004,-0.01401521,0.0032279,-0.00303495,0.01617195,-0.00661449,0.0043243,-0.00028808,-0.03768167,-0.01485916,-0.01589785,0.04584699,-0.01082699,-0.00105944,0.02191365,0.02971831,0.01446964,0.04951128,0.00893713,-0.02060085,0.03886463,-0.00291232,-0.0166336,-0.01158437,0.03759511,-0.02577991,-0.02322645,-0.03107439,-0.01007682,0.04449091,0.01327226,0.01996609,-0.02624156,-0.0072781,0.00340643,-0.00965124,0.01713852,-0.00088001,-0.03101669,-0.01771558,0.02162512,-0.00185739,-0.015869,-0.02259169,0.00725285,0.01403685,-0.00247592,0.0066217,0.0153785,-0.00735023,-0.01320012,-0.00382659,-0.01881198,0.00731777,0.00177715,-0.00947812,-0.01816279,-0.00194215,-0.01918706,0.02592418,0.06243731,0.00183485,-0.03473869,0.03468098,-0.04408697,0.02377465,0.04778012,-0.02717927,0.00718072,-0.00532333,0.00659646,-0.01491686,0.01125256,-0.00843221,0.01774443,-0.01271684,-0.0096296,-0.02427957,-0.04010529,0.02075954,-0.03309408,-0.02048544,-0.03323834,-0.01506113,0.01989396,0.00944927,0.02501532,-0.00911746,-0.01253651,0.0293288,0.00603022,0.02918454,0.02517401,0.00578497,-0.01930248,0.00014032,-0.01823493,-0.04036497,-0.03012225,-0.00531251,-0.00858369,0.01123814,-0.00045759,0.01051682,0.01618638,-0.01771558,0.03283441,-0.00241822,-0.00748728,0.01687885,0.0064017,0.01979297,-0.01497457,-0.02224546,0.03834528,0.01899952,-0.00513579,-0.00755942,-0.00685974,-0.01112994,0.04521223,0.03667182,0.02448154,-0.03248817,0.0729397,0.02554909,-0.00972337,-0.00077857,-0.01234176,0.05718611,0.02289464,0.02575106,-0.00212609,0.05415658,0.01785984,0.00436398,-0.01592671,-0.06826556,0.00824467,-0.03127636,0.01304143,0.040163,0.02603959,0.00663613,0.01230569,-0.00496628,-0.03511377,-0.01122371,0.02032675,-0.05060769,-0.00544595,-0.00538825,-0.00973058,-0.040163,-0.03410393,0.02363039,-0.00138493,0.02950192,-0.02638582,-0.01798968,-0.026155,-0.01474375,-0.00409709,0.00042197,-0.03346917,-0.02107692,-0.03156489,-0.02966061,-0.01199552,-0.03139177,0.01999494,0.01777328,-0.01755689,0.00643416,0.00657121,0.04480829,0.03309408,0.02475564,-0.00396364,0.01735492,-0.00429545,0.02295235,0.01265192,0.02433728,-0.01966313,0.00107116,-0.00841057,-0.00819418,0.03502721,-0.02331301,0.03716232,0.01205323,-0.03973021,0.01760017,-0.00665055,-0.01703754,-0.03799905,-0.00132723,-0.01206044,0.03494066,0.02104807,0.00625744,0.0090309]'::vector)"
+                                                              ],
+                                                              "Filter": "((ds_2.embedding IS NOT NULL) AND (NOT ds_2.is_noise) AND (ds_2.embedding_status = 'ready'::text))",
+                                                              "Shared Hit Blocks": 0,
+                                                              "Shared Read Blocks": 0,
+                                                              "Shared Dirtied Blocks": 0,
+                                                              "Shared Written Blocks": 0,
+                                                              "Local Hit Blocks": 0,
+                                                              "Local Read Blocks": 0,
+                                                              "Local Dirtied Blocks": 0,
+                                                              "Local Written Blocks": 0,
+                                                              "Temp Read Blocks": 0,
+                                                              "Temp Written Blocks": 0
+                                                            }
+                                                          ]
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "Node Type": "Index Scan",
+                              "Parent Relationship": "Inner",
+                              "Parallel Aware": false,
+                              "Async Capable": false,
+                              "Scan Direction": "Forward",
+                              "Index Name": "document_segments_pkey",
+                              "Relation Name": "document_segments",
+                              "Schema": "public",
+                              "Alias": "ds",
+                              "Startup Cost": 0.29,
+                              "Total Cost": 7.54,
+                              "Plan Rows": 1,
+                              "Plan Width": 259,
+                              "Disabled": false,
+                              "Output": [
+                                "ds.id",
+                                "ds.sequence",
+                                "ds.source_role",
+                                "ds.content_markdown",
+                                "ds.document_version_id"
+                              ],
+                              "Index Cond": "(ds.id = b.segment_id)",
+                              "Filter": "((NOT ds.is_noise) AND (ds.embedding_status = 'ready'::text))",
+                              "Shared Hit Blocks": 0,
+                              "Shared Read Blocks": 0,
+                              "Shared Dirtied Blocks": 0,
+                              "Shared Written Blocks": 0,
+                              "Local Hit Blocks": 0,
+                              "Local Read Blocks": 0,
+                              "Local Dirtied Blocks": 0,
+                              "Local Written Blocks": 0,
+                              "Temp Read Blocks": 0,
+                              "Temp Written Blocks": 0
+                            }
+                          ]
+                        },
+                        {
+                          "Node Type": "Index Scan",
+                          "Parent Relationship": "Inner",
+                          "Parallel Aware": false,
+                          "Async Capable": false,
+                          "Scan Direction": "Forward",
+                          "Index Name": "document_versions_pkey",
+                          "Relation Name": "document_versions",
+                          "Schema": "public",
+                          "Alias": "dv",
+                          "Startup Cost": 0.28,
+                          "Total Cost": 0.35,
+                          "Plan Rows": 1,
+                          "Plan Width": 32,
+                          "Disabled": false,
+                          "Output": [
+                            "dv.id",
+                            "dv.document_id"
+                          ],
+                          "Index Cond": "(dv.id = ds.document_version_id)",
+                          "Shared Hit Blocks": 0,
+                          "Shared Read Blocks": 0,
+                          "Shared Dirtied Blocks": 0,
+                          "Shared Written Blocks": 0,
+                          "Local Hit Blocks": 0,
+                          "Local Read Blocks": 0,
+                          "Local Dirtied Blocks": 0,
+                          "Local Written Blocks": 0,
+                          "Temp Read Blocks": 0,
+                          "Temp Written Blocks": 0
+                        }
+                      ]
+                    },
+                    {
+                      "Node Type": "Index Scan",
+                      "Parent Relationship": "Inner",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Scan Direction": "Forward",
+                      "Index Name": "documents_pkey",
+                      "Relation Name": "documents",
+                      "Schema": "public",
+                      "Alias": "d",
+                      "Startup Cost": 0.28,
+                      "Total Cost": 0.58,
+                      "Plan Rows": 1,
+                      "Plan Width": 60,
+                      "Disabled": false,
+                      "Output": [
+                        "d.id",
+                        "d.source_system",
+                        "d.external_id",
+                        "d.title",
+                        "d.summary",
+                        "d.created_at",
+                        "d.updated_at",
+                        "d.raw_metadata"
+                      ],
+                      "Index Cond": "(d.id = dv.document_id)",
+                      "Shared Hit Blocks": 0,
+                      "Shared Read Blocks": 0,
+                      "Shared Dirtied Blocks": 0,
+                      "Shared Written Blocks": 0,
+                      "Local Hit Blocks": 0,
+                      "Local Read Blocks": 0,
+                      "Local Dirtied Blocks": 0,
+                      "Local Written Blocks": 0,
+                      "Temp Read Blocks": 0,
+                      "Temp Written Blocks": 0
+                    }
+                  ]
+                },
+                {
+                  "Node Type": "Aggregate",
+                  "Strategy": "Plain",
+                  "Partial Mode": "Simple",
+                  "Parent Relationship": "Inner",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Startup Cost": 66.05,
+                  "Total Cost": 66.06,
+                  "Plan Rows": 1,
+                  "Plan Width": 16,
+                  "Disabled": false,
+                  "Output": [
+                    "count(*)",
+                    "COALESCE(sum(NULLIF(length(ds_all.content_markdown), 0)), '0'::bigint)"
+                  ],
+                  "Shared Hit Blocks": 0,
+                  "Shared Read Blocks": 0,
+                  "Shared Dirtied Blocks": 0,
+                  "Shared Written Blocks": 0,
+                  "Local Hit Blocks": 0,
+                  "Local Read Blocks": 0,
+                  "Local Dirtied Blocks": 0,
+                  "Local Written Blocks": 0,
+                  "Temp Read Blocks": 0,
+                  "Temp Written Blocks": 0,
+                  "Plans": [
+                    {
+                      "Node Type": "Bitmap Heap Scan",
+                      "Parent Relationship": "Outer",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Relation Name": "document_segments",
+                      "Schema": "public",
+                      "Alias": "ds_all",
+                      "Startup Cost": 4.41,
+                      "Total Cost": 65.89,
+                      "Plan Rows": 16,
+                      "Plan Width": 219,
+                      "Disabled": false,
+                      "Output": [
+                        "ds_all.content_markdown"
+                      ],
+                      "Recheck Cond": "(ds_all.document_version_id = dv.id)",
+                      "Shared Hit Blocks": 0,
+                      "Shared Read Blocks": 0,
+                      "Shared Dirtied Blocks": 0,
+                      "Shared Written Blocks": 0,
+                      "Local Hit Blocks": 0,
+                      "Local Read Blocks": 0,
+                      "Local Dirtied Blocks": 0,
+                      "Local Written Blocks": 0,
+                      "Temp Read Blocks": 0,
+                      "Temp Written Blocks": 0,
+                      "Plans": [
+                        {
+                          "Node Type": "Bitmap Index Scan",
+                          "Parent Relationship": "Outer",
+                          "Parallel Aware": false,
+                          "Async Capable": false,
+                          "Index Name": "document_segments_document_version_id_idx",
+                          "Startup Cost": 0,
+                          "Total Cost": 4.41,
+                          "Plan Rows": 16,
+                          "Plan Width": 0,
+                          "Disabled": false,
+                          "Index Cond": "(ds_all.document_version_id = dv.id)",
+                          "Shared Hit Blocks": 0,
+                          "Shared Read Blocks": 0,
+                          "Shared Dirtied Blocks": 0,
+                          "Shared Written Blocks": 0,
+                          "Local Hit Blocks": 0,
+                          "Local Read Blocks": 0,
+                          "Local Dirtied Blocks": 0,
+                          "Local Written Blocks": 0,
+                          "Temp Read Blocks": 0,
+                          "Temp Written Blocks": 0
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "Planning": {
+      "Shared Hit Blocks": 392,
+      "Shared Read Blocks": 88,
+      "Shared Dirtied Blocks": 0,
+      "Shared Written Blocks": 0,
+      "Local Hit Blocks": 0,
+      "Local Read Blocks": 0,
+      "Local Dirtied Blocks": 0,
+      "Local Written Blocks": 0,
+      "Temp Read Blocks": 0,
+      "Temp Written Blocks": 0
+    }
+  }
+}
+
+## Assistant
+
+## What the plan is telling you (the root cause)
+
+Your “hybrid” query is slow because **both sides are doing full table scans + sorts**:
+
+- **BM25/FTS side**: `Seq Scan` on `document_segments ds_1` then `Sort` by `ts_rank(...)` over ~11,810 rows.
+  - That means Postgres is **not using a GIN tsvector index** for the text match. In fact, in the plan it’s not even filtering by `@@ tsquery`; it’s scanning everything that matches `(NOT is_noise) AND embedding_status='ready'` and computing rank for all of them.
+- **Vector side**: `Seq Scan` on `document_segments ds_2` then `Sort` by `(embedding <=> query_vec)` over ~6,191 rows.
+  - That means Postgres is **not using a pgvector index** (IVFFLAT/HNSW). It’s computing distance for all rows and sorting.
+
+Those two seq-scans/sorts dominate runtime. The rest (PK lookups into `document_versions`, `documents`) is fine.
+
+## Highest-impact fixes
+
+### 1) Fix the FTS query so it can use a GIN index (and actually filter)
+Right now you’re doing something like:
+
+- compute `ts_rank(ds.content_plaintext, tsquery)` but **not** `WHERE ds.content_plaintext @@ tsquery`
+
+You want the FTS leg to look like:
+
+- `WHERE ds.content_plaintext @@ q`
+- order by `ts_rank(ds.content_plaintext, q)` (or `ts_rank_cd`)
+- `LIMIT k`
+
+And you want a **GIN index** on `content_plaintext` (tsvector), ideally partial to match your filters:
+
+- partial index where `(NOT is_noise) AND embedding_status='ready'` **if you must keep that filter**
+
+Even better: for keyword search you probably *shouldn’t* require `embedding_status='ready'`—that’s a self-inflicted reduction in recall and it also makes your partial-index logic awkward. Keep `NOT is_noise` though.
+
+### 2) Add a pgvector ANN index and structure the vector query to use it
+For the vector leg you want:
+
+- a query shaped like `ORDER BY embedding <=> query_vec LIMIT k`
+- with an ANN index on `embedding`:
+  - **HNSW** (best latency/recall; available in newer pgvector)
+  - or **IVFFLAT** (requires `ANALYZE`; needs `lists` tuning)
+
+Also consider making it a **partial index** matching your filter:
+
+- `WHERE embedding IS NOT NULL AND NOT is_noise AND embedding_status='ready'`
+
+Your plan shows you filter that way already; the index must match.
+
+### 3) Don’t compute expensive per-document aggregates inside the search query
+This part is also potentially expensive at scale:
+
+- the `Aggregate` over `ds_all` to compute `count(*)` and `sum(length(content_markdown))` for each returned row (per document version)
+
+It’s currently using an index (`document_version_id_idx`), so it might be “ok now”, but it will grow linearly with result count and segment counts.
+
+Better options:
+- **precompute** these stats on `document_versions` (segment_count, total_chars) during ingestion
+- or fetch them in a second query only for the 20 returned docs
+
+### 4) Two-phase “candidate then join” pattern
+You’re already close to this with the `Append` of BM25 + vector candidates, but you still pay the heavy scan/sort cost in each subquery.
+
+After you fix indexing, also make sure:
+- both legs return only `(segment_id, score)` (no big text)
+- then join to fetch `left(content_markdown, 280)` and document metadata for the top N
+
+## Concrete next step (what I need from you)
+To give you exact SQL + index DDL that matches your schema, I need to see how you store FTS and vector:
+
+- Is `document_segments.content_plaintext` a `tsvector` column? (plan suggests yes)
+- What pgvector index (if any) exists on `document_segments.embedding`?
+
+If you want, I can inspect the code in your repo and propose a patch. Tell me whether the backend code lives under `2brain/app` (FastAPI) and I’ll locate the `/search` implementation and the migration that creates indexes, then provide targeted edits.
