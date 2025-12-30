@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 
 from app.db import get_connection
-from app.schemas import DocumentSearchResult, SearchResult
 from app.metrics import log_query_stat
-import time
+from app.schemas import DocumentSearchResult, SearchResult
 from app.services.search import (
     embed_query_openai,
     search_documents_hybrid_rrf,
@@ -17,16 +17,23 @@ from app.services.search import (
     search_segments_hybrid_rrf,
 )
 
-
 router = APIRouter(tags=["search"])
 
 
 @router.get("/search", response_model=List[SearchResult])
 def search_endpoint(
-    query: Optional[str] = Query(None, description="Full-text query applied to segment content."),
-    source_system: Optional[str] = Query(None, description="Filter by source system (chatgpt, claude, other)."),
-    source_role: Optional[str] = Query(None, description="Filter by segment role (user, assistant, etc.)."),
-    document_id: Optional[UUID] = Query(None, description="Restrict results to a single document id."),
+    query: Optional[str] = Query(
+        None, description="Full-text query applied to segment content."
+    ),
+    source_system: Optional[str] = Query(
+        None, description="Filter by source system (chatgpt, claude, other)."
+    ),
+    source_role: Optional[str] = Query(
+        None, description="Filter by segment role (user, assistant, etc.)."
+    ),
+    document_id: Optional[UUID] = Query(
+        None, description="Restrict results to a single document id."
+    ),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     conn=Depends(get_connection),
@@ -48,7 +55,9 @@ def search_bm25_endpoint(
     q: str = Query(..., description="BM25 keyword query"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    threshold: float | None = Query(None, description="Optional score cutoff; lower (more negative) is better."),
+    threshold: float | None = Query(
+        None, description="Optional score cutoff; lower (more negative) is better."
+    ),
     conn=Depends(get_connection),
 ) -> List[SearchResult]:
     t0 = time.perf_counter()
@@ -84,7 +93,7 @@ def search_hybrid_endpoint(
     k: int = Query(60, ge=1),
     conn=Depends(get_connection),
 ) -> List[SearchResult]:
-    qvec = embed_query_openai(q)
+    qvec = embed_query_openai(q, conn=conn)
     t0 = time.perf_counter()
     results, meta = search_segments_hybrid_rrf(
         conn,
@@ -121,8 +130,12 @@ def search_hybrid_documents_endpoint(
     w_bm25: float = Query(0.5, ge=0.0, le=1.0),
     w_vec: float = Query(0.5, ge=0.0, le=1.0),
     k: int = Query(60, ge=1),
-    doc_topk: int = Query(3, ge=1, le=10, description="How many top segments contribute to doc score."),
-    doc_top_segments: int = Query(3, ge=1, le=10, description="How many segment previews to return."),
+    doc_topk: int = Query(
+        3, ge=1, le=10, description="How many top segments contribute to doc score."
+    ),
+    doc_top_segments: int = Query(
+        3, ge=1, le=10, description="How many segment previews to return."
+    ),
     segment_limit: Optional[int] = Query(
         None,
         ge=10,
@@ -130,7 +143,7 @@ def search_hybrid_documents_endpoint(
     ),
     conn=Depends(get_connection),
 ) -> List[DocumentSearchResult]:
-    qvec = embed_query_openai(q)
+    qvec = embed_query_openai(q, conn=conn)
     t0 = time.perf_counter()
     results, meta = search_documents_hybrid_rrf(
         conn,
@@ -178,7 +191,7 @@ def search_hybrid_documents_debug_endpoint(
     segment_limit: Optional[int] = Query(None, ge=10),
     conn=Depends(get_connection),
 ):
-    qvec = embed_query_openai(q)
+    qvec = embed_query_openai(q, conn=conn)
     results, meta = search_documents_hybrid_rrf(
         conn,
         q=q,

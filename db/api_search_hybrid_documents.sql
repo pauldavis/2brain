@@ -28,15 +28,20 @@ WITH settings AS (
         GREATEST(p_limit * GREATEST(p_doc_topk, p_doc_top_segments), 50)
     )::integer AS segment_limit
 ),
+q AS (
+  SELECT websearch_to_tsquery('english', p_query) AS tsq
+),
 bm AS (
   SELECT segment_id,
          ROW_NUMBER() OVER (ORDER BY score DESC) AS r
   FROM (
     SELECT ds.id AS segment_id,
-           ts_rank(ds.content_plaintext, websearch_to_tsquery('english', p_query)) AS score
-    FROM public.document_segments ds
+           ts_rank(ds.content_plaintext, q.tsq) AS score
+    FROM q
+    JOIN public.document_segments ds ON TRUE
     WHERE ds.embedding_status = 'ready'
       AND ds.is_noise = FALSE
+      AND ds.content_plaintext @@ q.tsq
     ORDER BY score DESC
     LIMIT p_k
   ) ranked

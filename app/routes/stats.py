@@ -195,6 +195,39 @@ def stats_queries() -> Dict[str, Any]:
     return {"ok": True, "items": get_query_stats()}
 
 
+@router.get("/stats/db")
+def stats_db(conn=Depends(get_connection)) -> Dict[str, Any]:
+    """
+    Report DB identity info and embedding-cache row counts to debug environment mismatch.
+    """
+    try:
+        ident = conn.execute(
+            """
+            SELECT
+                current_database() AS db,
+                current_user AS "user",
+                inet_server_addr() AS host,
+                inet_server_port() AS port
+            """
+        ).fetchone()
+        cache = conn.execute(
+            """
+            SELECT
+                COUNT(*)::bigint AS rows,
+                MIN(created_at) AS oldest,
+                MAX(created_at) AS newest
+            FROM public.query_embedding_cache
+            """
+        ).fetchone()
+        return {
+            "ok": True,
+            "db": dict(ident) if ident else None,
+            "query_embedding_cache": dict(cache) if cache else None,
+        }
+    except Exception as e:  # pragma: no cover - diagnostic endpoint
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 @router.get("/stats/coverage")
 def stats_coverage(conn=Depends(get_connection)) -> Dict[str, Any]:
     data: Dict[str, Any] = {"ok": True}

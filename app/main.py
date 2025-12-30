@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import get_current_user
 from app.config import get_settings
 from app.routes import admin, attachments, documents, ingest, search, stats
+
+# Ensure INFO-level logs from app modules show up when running under uvicorn.
+# Uvicorn configures its own loggers; this ensures our application loggers
+# have a handler/level as well.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 app = FastAPI(
     title="2brain Document Service",

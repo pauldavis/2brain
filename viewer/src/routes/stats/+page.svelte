@@ -12,6 +12,8 @@
         fts?: any;
         coverage?: any;
         table?: any;
+        queries?: any;
+        db?: any;
     };
 
     let snapshots = $state<Snapshot[]>([]);
@@ -31,17 +33,18 @@
 
     async function pollOnce() {
         try {
-            const [vectorizer, fts, coverage, table, queries] =
+            const [vectorizer, fts, coverage, table, queries, db] =
                 await Promise.all([
                     fetchJSON("stats/vectorizer"),
                     fetchJSON("stats/fts"),
                     fetchJSON("stats/coverage"),
                     fetchJSON("stats/table"),
                     fetchJSON("stats/queries"),
+                    fetchJSON("stats/db"),
                 ]);
             const t = new Date().toISOString();
             snapshots = [
-                { t, vectorizer, fts, coverage, table, queries },
+                { t, vectorizer, fts, coverage, table, queries, db },
                 ...snapshots,
             ].slice(0, 200);
         } catch (e) {
@@ -117,6 +120,16 @@
                     <h2 class="text-lg font-semibold">Table</h2>
                     <pre class="text-xs overflow-auto">{JSON.stringify(
                             snapshots[0].table,
+                            null,
+                            2,
+                        )}</pre>
+                </div>
+                <div
+                    class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm md:col-span-2"
+                >
+                    <h2 class="text-lg font-semibold">DB</h2>
+                    <pre class="text-xs overflow-auto">{JSON.stringify(
+                            snapshots[0].db,
                             null,
                             2,
                         )}</pre>
