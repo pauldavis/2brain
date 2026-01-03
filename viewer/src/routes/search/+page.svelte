@@ -185,7 +185,19 @@
 </script>
 
 <main class="min-h-screen space-y-6 bg-slate-50 p-6 text-slate-900">
-    <h1 class="text-2xl font-semibold text-slate-900">Search</h1>
+    <div class="flex flex-wrap items-center justify-between gap-3">
+        <h1 class="text-2xl font-semibold text-slate-900">Search</h1>
+        <div class="flex gap-2">
+            <a class="btn btn-outline btn-sm" href="/">
+                <span aria-hidden="true">📄</span>
+                Documents
+            </a>
+            <a class="btn btn-outline btn-sm" href="/chat">
+                <span aria-hidden="true">💬</span>
+                Chat
+            </a>
+        </div>
+    </div>
 
     <div
         class="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm"

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import get_current_user
 from app.config import get_settings
-from app.routes import admin, attachments, documents, ingest, search, stats
+from app.routes import admin, attachments, chat, documents, ingest, search, stats
 
 # Ensure INFO-level logs from app modules show up when running under uvicorn.
 # Uvicorn configures its own loggers; this ensures our application loggers
@@ -43,3 +43,4 @@ app.include_router(search.router, dependencies=[Depends(get_current_user)])
 app.include_router(stats.router, dependencies=[Depends(get_current_user)])
 app.include_router(ingest.router, dependencies=[Depends(get_current_user)])
 app.include_router(admin.router, dependencies=[Depends(get_current_user)])
+app.include_router(chat.router, dependencies=[Depends(get_current_user)])

@@ -665,10 +665,16 @@
 
     <main class="flex min-h-screen flex-col gap-6 overflow-y-auto p-6 lg:p-10">
         <div class="flex flex-wrap items-center justify-between gap-3">
-            <a class="btn btn-outline btn-sm" href="/search">
-                <span aria-hidden="true">←</span>
-                Back to search
-            </a>
+            <div class="flex gap-2">
+                <a class="btn btn-outline btn-sm" href="/search">
+                    <span aria-hidden="true">🔍</span>
+                    Search
+                </a>
+                <a class="btn btn-outline btn-sm" href="/chat">
+                    <span aria-hidden="true">💬</span>
+                    Chat
+                </a>
+            </div>
             <button
                 type="button"
                 class="btn btn-ghost btn-sm md:hidden"
