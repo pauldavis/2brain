@@ -48,7 +48,8 @@
         model: "gpt-4o",
         temperature: 0.7,
         max_tokens: 4096,
-        context_limit: 5,
+        context_limit: 10,
+        max_context_chars: 50000,
         w_bm25: 0.5,
         w_vec: 0.5,
         include_conversation_history: 10,
@@ -506,7 +507,9 @@
             <!-- Settings Panel (collapsible) -->
             {#if showSettings}
                 <div class="border-b border-slate-200 bg-slate-50 p-4">
-                    <div class="grid grid-cols-2 gap-4 md:grid-cols-4">
+                    <div
+                        class="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-5"
+                    >
                         <label class="form-control">
                             <span class="label-text text-xs">Model</span>
                             <select
@@ -542,9 +545,24 @@
                                 type="range"
                                 class="range range-sm"
                                 min="0"
-                                max="20"
+                                max="50"
                                 step="1"
                                 bind:value={config.context_limit}
+                            />
+                        </label>
+                        <label class="form-control">
+                            <span class="label-text text-xs"
+                                >Max Context ({Math.round(
+                                    config.max_context_chars / 1000,
+                                )}k chars)</span
+                            >
+                            <input
+                                type="range"
+                                class="range range-sm"
+                                min="5000"
+                                max="100000"
+                                step="5000"
+                                bind:value={config.max_context_chars}
                             />
                         </label>
                         <label class="form-control">
@@ -561,6 +579,11 @@
                             />
                         </label>
                     </div>
+                    <p class="mt-2 text-xs text-slate-500">
+                        Retrieves up to {config.context_limit} segments, limited to
+                        ~{Math.round(config.max_context_chars / 4)}k tokens of
+                        context.
+                    </p>
                     <div class="mt-3 flex justify-end gap-2">
                         <button
                             class="btn btn-ghost btn-sm"

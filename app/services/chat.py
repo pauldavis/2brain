@@ -54,7 +54,8 @@ class ChatConfig:
     temperature: float = 0.7
     max_tokens: int = 4096
     # RAG settings
-    context_limit: int = 5  # Max segments to retrieve
+    context_limit: int = 10  # Max segments to retrieve (increased from 5)
+    max_context_chars: int = 50000  # Max total characters of context (~12k tokens)
     w_bm25: float = 0.5
     w_vec: float = 0.5
     include_conversation_history: int = 10  # Max previous messages to include
@@ -176,7 +177,7 @@ def update_conversation_config(
         cur.execute(
             """
             UPDATE documents
-            SET raw_metadata = raw_metadata || %s
+            SET raw_metadata = raw_metadata || %s::jsonb
             WHERE id = %s AND source_system = '2brain'
             """,
             (Json({"chat_config": _config_to_dict(config)}), document_id),
@@ -464,7 +465,8 @@ def retrieve_context(
     conn: psycopg.Connection,
     query: str,
     *,
-    limit: int = 5,
+    limit: int = 10,
+    max_context_chars: int = 50000,
     w_bm25: float = 0.5,
     w_vec: float = 0.5,
     exclude_document_id: Optional[UUID] = None,
@@ -476,6 +478,7 @@ def retrieve_context(
         conn: Database connection
         query: The search query (typically the user's message)
         limit: Maximum number of segments to retrieve
+        max_context_chars: Maximum total characters of context to include
         w_bm25: Weight for BM25 component
         w_vec: Weight for vector similarity component
         exclude_document_id: Optional document ID to exclude from results
@@ -487,23 +490,44 @@ def retrieve_context(
     # Embed the query
     query_embedding = embed_query_openai(query, conn=conn)
 
-    # Perform hybrid search
+    # Perform hybrid search - fetch more candidates for filtering
     results, _meta = search_segments_hybrid_rrf(
         conn,
         q=query,
         q_embedding=query_embedding,
-        limit=limit * 2,  # Fetch extra in case we need to filter
+        limit=limit * 3,  # Fetch extra for filtering and full content lookup
         offset=0,
         w_bm25=w_bm25,
         w_vec=w_vec,
     )
 
-    # Convert to RetrievedContext and filter if needed
+    if not results:
+        return []
+
+    # Fetch full content for the candidate segments (snippets are truncated to 280 chars)
+    segment_ids = [r.segment_id for r in results]
+    full_content_map = _fetch_full_segment_content(conn, segment_ids)
+
+    # Convert to RetrievedContext with full content, respecting limits
     context_list = []
+    total_chars = 0
+
     for rank, result in enumerate(results, start=1):
         if exclude_document_id and result.document_id == exclude_document_id:
             continue
         if len(context_list) >= limit:
+            break
+
+        # Get full content, fall back to snippet if not found
+        full_content = full_content_map.get(result.segment_id, result.snippet)
+
+        # Check if adding this segment would exceed char limit
+        if total_chars + len(full_content) > max_context_chars and context_list:
+            # Already have some context, stop here
+            logger.info(
+                f"[retrieve_context] Stopping at {len(context_list)} segments "
+                f"({total_chars} chars) to stay under {max_context_chars} char limit"
+            )
             break
 
         context_list.append(
@@ -512,14 +536,41 @@ def retrieve_context(
                 document_id=result.document_id,
                 document_title=result.document_title,
                 source_system=result.source_system,
-                content=result.snippet,
+                content=full_content,
                 score=0.0,  # RRF doesn't give us a simple score
                 rank=rank,
                 source_role=result.source_role,
             )
         )
+        total_chars += len(full_content)
 
+    logger.info(
+        f"[retrieve_context] Retrieved {len(context_list)} segments, "
+        f"{total_chars} total chars for query: {query[:50]}..."
+    )
     return context_list
+
+
+def _fetch_full_segment_content(
+    conn: psycopg.Connection,
+    segment_ids: List[UUID],
+) -> dict[UUID, str]:
+    """Fetch the full content_markdown for a list of segment IDs."""
+    if not segment_ids:
+        return {}
+
+    with conn.cursor() as cur:
+        # Use ANY to fetch all in one query
+        cur.execute(
+            """
+            SELECT id, content_markdown
+            FROM document_segments
+            WHERE id = ANY(%s)
+            """,
+            (segment_ids,),
+        )
+        rows = cur.fetchall()
+        return {row["id"]: row["content_markdown"] for row in rows}
 
 
 def build_prompt_messages(
@@ -601,6 +652,7 @@ def generate_response(
         conn,
         user_message,
         limit=config.context_limit,
+        max_context_chars=config.max_context_chars,
         w_bm25=config.w_bm25,
         w_vec=config.w_vec,
         exclude_document_id=document_id,
@@ -673,6 +725,7 @@ def generate_response_stream(
         conn,
         user_message,
         limit=config.context_limit,
+        max_context_chars=config.max_context_chars,
         w_bm25=config.w_bm25,
         w_vec=config.w_vec,
         exclude_document_id=document_id,
@@ -813,6 +866,7 @@ def _config_to_dict(config: ChatConfig) -> dict:
         "temperature": config.temperature,
         "max_tokens": config.max_tokens,
         "context_limit": config.context_limit,
+        "max_context_chars": config.max_context_chars,
         "w_bm25": config.w_bm25,
         "w_vec": config.w_vec,
         "include_conversation_history": config.include_conversation_history,
@@ -825,7 +879,8 @@ def _dict_to_config(d: dict) -> ChatConfig:
         model=d.get("model", "gpt-4o"),
         temperature=d.get("temperature", 0.7),
         max_tokens=d.get("max_tokens", 4096),
-        context_limit=d.get("context_limit", 5),
+        context_limit=d.get("context_limit", 10),
+        max_context_chars=d.get("max_context_chars", 50000),
         w_bm25=d.get("w_bm25", 0.5),
         w_vec=d.get("w_vec", 0.5),
         include_conversation_history=d.get("include_conversation_history", 10),

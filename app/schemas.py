@@ -162,7 +162,13 @@ class ChatConfigSchema(BaseModel):
         default=4096, ge=1, le=128000, description="Maximum tokens in response"
     )
     context_limit: int = Field(
-        default=5, ge=0, le=20, description="Max segments to retrieve as context"
+        default=10, ge=0, le=50, description="Max segments to retrieve as context"
+    )
+    max_context_chars: int = Field(
+        default=50000,
+        ge=0,
+        le=200000,
+        description="Max total characters of context (~4 chars per token)",
     )
     w_bm25: float = Field(
         default=0.5, ge=0.0, le=1.0, description="Weight for BM25 search"
