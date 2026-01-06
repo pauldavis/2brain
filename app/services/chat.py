@@ -504,9 +504,9 @@ def retrieve_context(
     if not results:
         return []
 
-    # Fetch full content for the candidate segments (snippets are truncated to 280 chars)
+    # Fetch full content and timestamps for the candidate segments (snippets are truncated to 280 chars)
     segment_ids = [r.segment_id for r in results]
-    full_content_map = _fetch_full_segment_content(conn, segment_ids)
+    segment_details = _fetch_full_segment_details(conn, segment_ids)
 
     # Convert to RetrievedContext with full content, respecting limits
     context_list = []
@@ -519,7 +519,8 @@ def retrieve_context(
             break
 
         # Get full content, fall back to snippet if not found
-        full_content = full_content_map.get(result.segment_id, result.snippet)
+        details = segment_details.get(result.segment_id)
+        full_content = details.content if details else result.snippet
 
         # Check if adding this segment would exceed char limit
         if total_chars + len(full_content) > max_context_chars and context_list:
@@ -544,6 +545,16 @@ def retrieve_context(
         )
         total_chars += len(full_content)
 
+    # Sort context chronologically (oldest first, newest last)
+    # This helps the LLM understand the temporal flow of information
+    def get_sort_key(ctx: RetrievedContext) -> tuple:
+        details = segment_details.get(ctx.segment_id)
+        ts = details.started_at if details else None
+        # Use a very old date for None timestamps so they sort first
+        return (ts or datetime.min.replace(tzinfo=timezone.utc),)
+
+    context_list.sort(key=get_sort_key)
+
     logger.info(
         f"[retrieve_context] Retrieved {len(context_list)} segments, "
         f"{total_chars} total chars for query: {query[:50]}..."
@@ -551,11 +562,19 @@ def retrieve_context(
     return context_list
 
 
-def _fetch_full_segment_content(
+@dataclass
+class SegmentDetails:
+    """Full content and metadata for a segment."""
+
+    content: str
+    started_at: Optional[datetime] = None
+
+
+def _fetch_full_segment_details(
     conn: psycopg.Connection,
     segment_ids: List[UUID],
-) -> dict[UUID, str]:
-    """Fetch the full content_markdown for a list of segment IDs."""
+) -> dict[UUID, SegmentDetails]:
+    """Fetch the full content_markdown and timestamps for a list of segment IDs."""
     if not segment_ids:
         return {}
 
@@ -563,14 +582,20 @@ def _fetch_full_segment_content(
         # Use ANY to fetch all in one query
         cur.execute(
             """
-            SELECT id, content_markdown
+            SELECT id, content_markdown, started_at
             FROM document_segments
             WHERE id = ANY(%s)
             """,
             (segment_ids,),
         )
         rows = cur.fetchall()
-        return {row["id"]: row["content_markdown"] for row in rows}
+        return {
+            row["id"]: SegmentDetails(
+                content=row["content_markdown"],
+                started_at=row["started_at"],
+            )
+            for row in rows
+        }
 
 
 def build_prompt_messages(
